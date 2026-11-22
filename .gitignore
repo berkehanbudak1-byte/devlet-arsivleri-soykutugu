@@ -1,0 +1,18 @@
+# Python & OS artifacts
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Never commit personal genealogy files, downloaded archive ZIPs/PDFs, or crops
+Soyagaci_Arsiv/
+belge_gorselleri/
+crops/
+output/
+private/
+*.pdf
+*.zip
+*.rar
+*Alt-Ust-Soy*
+*Alt_Ust_Soy*
