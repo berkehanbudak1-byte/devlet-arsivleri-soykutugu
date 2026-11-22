@@ -1,7 +1,8 @@
 # Devlet Arşivleri Soy Kütüğü ve Köy Tarihi Araştırma Becerisi (`devlet-arsivleri-soykutugu`)
 
 > **e-Devlet Alt-Üst Soy Bilgisi** belgeniz belli bir tarihte kesiliyor mu?  
-> Bu açık kaynaklı yapay zekâ becerisi (**Agent Skill**), şifrenizi hiçbir yere vermeden **T.C. Cumhurbaşkanlığı Devlet Arşivleri Başkanlığı Kataloğu** ve indirdiğiniz orijinal Osmanlıca el yazması defterler üzerinden **anne ve baba tarafı soy ağacınızı**, **köyünüzün eski adını ve tarihini** 1:1 piksel belge kesitleriyle **1500'lü yıllara kadar** kanıtlı biçimde indirmenizi sağlar.
+> Bu açık kaynaklı yapay zekâ becerisi (**Agent Skill**), şifrenizi hiçbir yere vermeden **T.C. Cumhurbaşkanlığı Devlet Arşivleri Başkanlığı Kataloğu** ve indirdiğiniz orijinal Osmanlıca el yazması defterler üzerinden **anne ve baba tarafı soy ağacınızı**, **köyünüzün eski adını ve tarihini** 1:1 piksel belge kesitleriyle **1500'lü yıllara kadar** kanıtlı biçimde indirmenizi sağlar.  
+> *Bu çalışma, **Said Sürücü**'nün seminerinden hareketle hazırlanmış ve geliştirilmiştir; ufuk açıcı katkıları için kendisine içtenlikle teşekkür ederiz.*
 
 ---
 
@@ -20,7 +21,7 @@
 6. [Defterde Karşılaşacağınız 15 Temel Osmanlıca Arşiv Kelimesi](#6-defterde-karşılaşacağınız-15-temel-osmanlıca-arşiv-kelimesi)
 7. [Göçmen ve Mübadil Aileler İçin Rehber (Balkanlar, Adalar, Girit ve Kafkasya)](#7-göçmen-ve-mübadil-aileler-için-rehber-balkanlar-adalar-girit-ve-kafkasya)
 8. [5 Adımda Hızlı Başlangıç ve Kopyala–Yapıştır Ana Prompt](#8-5-adımda-hızlı-başlangıç-ve-kopyalayapıştır-ana-prompt)
-9. [Paket Yapısı ve Lisans](#9-paket-yapısı-ve-lisans)
+9. [Paket Yapısı, Teşekkür ve Lisans](#9-paket-yapısı-teşekkür-ve-lisans)
 
 ---
 
@@ -225,7 +226,7 @@ Lütfen `devlet-arsivleri-soykutugu` becerisini etkinleştirerek tahmin yürütm
 
 ---
 
-## 9. Paket Yapısı ve Lisans
+## 9. Paket Yapısı, Teşekkür ve Lisans
 
 ```text
 devlet-arsivleri-soykutugu/
@@ -241,5 +242,11 @@ devlet-arsivleri-soykutugu/
 └── examples/
     └── ornek-kullanim-promptlari.md                 # 4 farklı senaryo için hazır kopyala-yapıştır istem şablonları
 ```
+
+### Teşekkür ve İlham Kaynağı
+
+Bu beceri paketi ve araştırma metodolojisi, **Said Sürücü**'nün seminerinden hareketle hazırlanmış ve geliştirilmiştir. Yapay zekâ destekli arşiv ve soy kütüğü araştırmalarına ilham veren kıymetli paylaşımı ve rehberliği için **Said Sürücü**'ye gönülden teşekkür ederiz.
+
+### Lisans
 
 Bu proje **MIT Lisansı** ile herkesin özgürce kullanımına, geliştirmesine ve paylaşımına sunulmuştur.

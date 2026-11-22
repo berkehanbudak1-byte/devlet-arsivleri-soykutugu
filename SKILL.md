@@ -15,7 +15,7 @@ description: >-
 
 # Devlet Arşivleri Soy Kütüğü ve Köy Tarihi Araştırma Becerisi
 
-Bu beceri, kullanıcının **e-Devlet Alt-Üst Soy Bilgisi** belgesindeki en eski kayıt duvarını ("Kütük Duvarı", 1881–1905) aşarak, **T.C. Cumhurbaşkanlığı Devlet Arşivleri Başkanlığı Kataloğu** (`https://katalog.devletarsivleri.gov.tr`) ve indirilen orijinal defter görüntüleri üzerinden **anne ve baba tarafı soy kütüğünü**, **köyün/mahallenin eski adını ve idari evrimini**, **köydeki önemli şahsiyetleri** ve **tarihî olayları** 16. yüzyıla kadar kanıtlı biçimde araştırır.
+Bu beceri, **Said Sürücü**'nün seminerinden hareketle geliştirilmiş olup; kullanıcının **e-Devlet Alt-Üst Soy Bilgisi** belgesindeki en eski kayıt duvarını ("Kütük Duvarı", 1881–1905) aşarak, **T.C. Cumhurbaşkanlığı Devlet Arşivleri Başkanlığı Kataloğu** (`https://katalog.devletarsivleri.gov.tr`) ve indirilen orijinal defter görüntüleri üzerinden **anne ve baba tarafı soy kütüğünü**, **köyün/mahallenin eski adını ve idari evrimini**, **köydeki önemli şahsiyetleri** ve **tarihî olayları** 16. yüzyıla kadar kanıtlı biçimde araştırır.
 
 - **Fon Kodları, Takvim Hesabı, Varyant Matrisi ve Sözlük:** [fon-kodlari-ve-paleografya-rehberi.md](./references/fon-kodlari-ve-paleografya-rehberi.md)
 - **Balkanlar, Adalar, Girit ve Kafkasya Göçmen/Mübadil Rehberi:** [gocmen-ve-mubadil-rehberi.md](./references/gocmen-ve-mubadil-rehberi.md)
