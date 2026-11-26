@@ -82,7 +82,7 @@ Katalog aramalarında Arap alfabesindeki çok sesli harflerden kaynaklanan şu d
 | **bint / binti** | `بنت` | Kızı (Şer'iyye sicilleri ve vakfiyelerde kadınların baba adını bağlar: *Fatma binti Ali*). |
 | **karındaşı / birâderi** | `قرنداشى / برادرى` | Erkek kardeşi. |
 | **torunu / hafîdi** | `طورونى / حفيدى` | Torunu. |
-| **oğlu / zâde / uşağı** | `اوغلى / زاده / اوشاغى` | Sülale, aile veya oymak lakabı eki (*Demircioğlu, Müftüzâde, Хaliluşağı*). |
+| **oğlu / zâde / uşağı** | `اوغلى / زاده / اوشاغى` | Sülale, aile veya oymak lakabı eki (*Demircioğlu, Müftüzâde, Haliluşağı*). |
 | **hâne** | `خانه` | Aynı çatı ve ocak altında yaşayan aile/vergi birimi. |
 | **nefer / neferân** | `نفر / نفران` | Kayıtlı erkek kişi / kişiler. |
 | **sinn** *(Dikkat!)* | `سن` | **Yaş.** (`سن ٤٠` = 40 yaşında. Sıkça *sene* ile karıştırılır!). |
@@ -109,7 +109,7 @@ Katalog aramalarında Arap alfabesindeki çok sesli harflerden kaynaklanan şu d
 | **fevt** | `فوت` | Vefat etti (`فوت فى جا سنه ٢٥٤` = Cemâziyelevvel 1254'te öldü; genelde kırmızı mürekkeple yazılır). |
 | **reft be-askeriyye / askerde** | `رفت بعسكريه / عسكرده` | Nizamiye ordusuna (*Asâkir-i Mansûre / Şâhâne*) sevk edildi / askerde bulunuyor. |
 | **redîf** | `رديف` | 1834'ten itibaren taşrada kurulan ihtiyat (yedek) taburlarına kayıtlı asker. |
-| **gâib / mecnûn / يek-çeşm** | `غائب / مجنون / يكچشم` | Köy dışında gurbette (veya kayıp) / akıl hastası / tek gözlü. |
+| **gâib / mecnûn / yek-çeşm** | `غائب / مجنون / يكچشم` | Köy dışında gurbette (veya kayıp) / akıl hastası / tek gözlü. |
 
 ### C. Nüfus Defterlerinde Sık Geçen Fiziksel Eşkâl Sıfatları
 - **Boy:** `orta boylu` (`اورته بويلو`), `uzun boylu` (`اوزون بويلو`), `kısa boylu` (`قصه بويلو`).

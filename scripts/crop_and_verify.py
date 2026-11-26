@@ -40,10 +40,11 @@ def extract_zips_if_needed(input_dir: Path, extract_root: Path) -> list[Path]:
                 if not target.exists():
                     target.mkdir(parents=True, exist_ok=True)
                     with zipfile.ZipFile(fpath, "r") as zf:
+                        target_resolved = target.resolve()
                         for member in zf.infolist():
                             # Zip-slip güvenlik kontrolü
                             dest = (target / member.filename).resolve()
-                            if not str(dest).startswith(str(target.resolve())):
+                            if not dest.is_relative_to(target_resolved):
                                 raise ValueError(f"Güvensiz zip yolu reddedildi: {member.filename}")
                             zf.extract(member, target)
                 for zroot, _, zfiles in os.walk(target):
@@ -67,6 +68,8 @@ def extract_zips_if_needed(input_dir: Path, extract_root: Path) -> list[Path]:
 
 def cmd_inventory(args: argparse.Namespace) -> None:
     in_dir = Path(args.input)
+    if not in_dir.exists():
+        sys.exit(f"Hata: Girdi klasörü bulunamadı: {in_dir}")
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
     imgs = extract_zips_if_needed(in_dir, out_dir / "_extracted")
@@ -79,6 +82,8 @@ def cmd_inventory(args: argparse.Namespace) -> None:
 
 def cmd_split(args: argparse.Namespace) -> None:
     img_path = Path(args.image)
+    if not img_path.is_file():
+        sys.exit(f"Hata: Görüntü dosyası bulunamadı: {img_path}")
     out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -112,10 +117,15 @@ def cmd_split(args: argparse.Namespace) -> None:
 
 def cmd_crop(args: argparse.Namespace) -> None:
     img_path = Path(args.image)
+    if not img_path.is_file():
+        sys.exit(f"Hata: Görüntü dosyası bulunamadı: {img_path}")
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    vals = [float(v.strip()) for v in args.box.split(",")]
+    try:
+        vals = [float(v.strip()) for v in args.box.split(",")]
+    except ValueError:
+        sys.exit("Hata: --box parametresi sayısal değerlerden oluşmalıdır ('x1,y1,x2,y2').")
     if len(vals) != 4:
         sys.exit("Hata: --box parametresi 'x1,y1,x2,y2' formatında 4 sayı olmalıdır (0.0-1.0 oran veya piksel).")
 
@@ -126,6 +136,11 @@ def cmd_crop(args: argparse.Namespace) -> None:
             x1, y1, x2, y2 = int(vals[0] * w), int(vals[1] * h), int(vals[2] * w), int(vals[3] * h)
         else:
             x1, y1, x2, y2 = [int(v) for v in vals]
+
+        x1, x2 = max(0, min(w, x1)), max(0, min(w, x2))
+        y1, y2 = max(0, min(h, y1)), max(0, min(h, y2))
+        if x2 <= x1 or y2 <= y1:
+            sys.exit(f"Hata: Geçersiz kesit koordinatları ({x1},{y1},{x2},{y2}); x2 > x1 ve y2 > y1 olmalıdır.")
 
         crop = im.crop((x1, y1, x2, y2))
         if args.zoom and args.zoom > 1:

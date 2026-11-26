@@ -92,16 +92,22 @@
    * Not: Aynı kaynak (same-origin) olduğundan img.crossOrigin ayarlanmaz.
    */
   async function renderSpreadPage(belgeUrl, mi = 0, mode = 'full', maxWidth = 1600, returnDataUrl = false) {
-    const targetUrl = belgeUrl.replace(/([?&])Mi=\d+/, '$1Mi=' + mi);
+    let targetUrl;
+    if (/([?&])Mi=\d+/i.test(belgeUrl)) {
+      targetUrl = belgeUrl.replace(/([?&])Mi=\d+/i, '$1Mi=' + mi);
+    } else {
+      targetUrl = belgeUrl + (belgeUrl.includes('?') ? '&' : '?') + 'Mi=' + mi;
+    }
     const resp = await fetch(targetUrl);
     const html = await resp.text();
     assertSafeResponse(resp, html);
 
     const doc = new DOMParser().parseFromString(html, 'text/html');
-    const src = doc.getElementById('sample_picture')?.src;
-    if (!src) {
+    const rawSrc = doc.getElementById('sample_picture')?.getAttribute('src');
+    if (!rawSrc) {
       throw new Error('Belge görüntüsü (#sample_picture) bulunamadı veya oturum doğrulaması gerekiyor.');
     }
+    const src = new URL(rawSrc, new URL(targetUrl, window.location.href)).href;
 
     const img = new Image();
     img.src = src;

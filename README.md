@@ -92,21 +92,21 @@ Terminalinizi (Windows'ta **PowerShell**, macOS/Linux'ta **Terminal**) açıp ku
 **1. Google Antigravity (Tüm projelerde geçerli genel kurulum — Önerilen):**
 ```powershell
 # Windows (PowerShell)
-git clone https://github.com/shnfatih-hash/devlet-arsivleri-soykutugu.git "$HOME\.gemini\config\skills\devlet-arsivleri-soykutugu"
+git clone https://github.com/berkehanbudak1-byte/devlet-arsivleri-soykutugu.git "$HOME\.gemini\config\skills\devlet-arsivleri-soykutugu"
 ```
 ```bash
 # macOS / Linux
-git clone https://github.com/shnfatih-hash/devlet-arsivleri-soykutugu.git ~/.gemini/config/skills/devlet-arsivleri-soykutugu
+git clone https://github.com/berkehanbudak1-byte/devlet-arsivleri-soykutugu.git ~/.gemini/config/skills/devlet-arsivleri-soykutugu
 ```
 
 **2. Proje Bazlı Kurulum (Sadece açık olan çalışma klasörü için):**
 ```bash
-git clone https://github.com/shnfatih-hash/devlet-arsivleri-soykutugu.git .agents/skills/devlet-arsivleri-soykutugu
+git clone https://github.com/berkehanbudak1-byte/devlet-arsivleri-soykutugu.git .agents/skills/devlet-arsivleri-soykutugu
 ```
 
 **3. Claude Code veya Codex Kurulumu:**
 ```bash
-git clone https://github.com/shnfatih-hash/devlet-arsivleri-soykutugu.git ~/.claude/skills/devlet-arsivleri-soykutugu
+git clone https://github.com/berkehanbudak1-byte/devlet-arsivleri-soykutugu.git ~/.claude/skills/devlet-arsivleri-soykutugu
 ```
 
 **Python Görüntü Kesit Kütüphanesini Yükleme:**
