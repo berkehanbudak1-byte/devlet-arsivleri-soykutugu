@@ -531,6 +531,308 @@ def cmd_lineage_tree(args: argparse.Namespace) -> None:
     print(res["markdown"])
 
 
+def trace_migration_timeline(records: list[dict[str, object]]) -> dict[str, object]:
+    """
+    Osmanlı Nüfus, Temettuat, Tahrir ve Muhacir/Mübadil kayıtlarından (`kaza`, `nahiye`,
+    `karye`, `yil`/`hicri_yil`/`rumi_yil`/`miladi_yil`) kronolojik göç zaman çizelgesi,
+    köy adı / idari bağ çapraz referansları ve Mermaid (`flowchart LR`) göç diyagramı üretir.
+    """
+    if not isinstance(records, list) or not records:
+        raise ValueError("Kayıt listesi (`records`) boş olamaz.")
+
+    parsed: list[dict[str, object]] = []
+    for idx, rec in enumerate(records, 1):
+        if not isinstance(rec, dict):
+            raise ValueError(f"{idx}. kayıt geçerli bir sözlük (dict) değil.")
+
+        kaza = str(rec.get("kaza") or "").strip()
+        nahiye = str(rec.get("nahiye") or "").strip()
+        karye = str(rec.get("karye") or rec.get("koy") or rec.get("mahalle") or rec.get("place") or rec.get("yer") or "").strip()
+        if not any([kaza, nahiye, karye]):
+            raise ValueError(f"{idx}. kayıtta en az bir yerleşim alanı ('kaza', 'nahiye' veya 'karye') zorunludur.")
+
+        vilayet = str(rec.get("vilayet") or rec.get("eyalet") or "").strip()
+        sancak = str(rec.get("sancak") or rec.get("liva") or "").strip()
+        eski_ad = str(rec.get("eski_ad") or rec.get("old_name") or rec.get("osmanlica_ad") or "").strip()
+        kisi = str(rec.get("kisi") or rec.get("isim") or rec.get("sulale") or "").strip()
+        olay = str(rec.get("olay") or rec.get("sebep") or rec.get("not") or rec.get("serh") or rec.get("note") or "").strip()
+        fon = str(rec.get("fon") or rec.get("kaynak") or rec.get("defter") or "").strip()
+        takvim_hint = str(rec.get("takvim") or "").strip().lower()
+
+        miladi_raw = rec.get("miladi_yil") if rec.get("miladi_yil") is not None else rec.get("miladi")
+        rumi_raw = rec.get("rumi_yil") if rec.get("rumi_yil") is not None else rec.get("rumi")
+        hicri_raw = rec.get("hicri_yil") if rec.get("hicri_yil") is not None else rec.get("hicri")
+        yil_raw = rec.get("yil") if rec.get("yil") is not None else rec.get("year")
+
+        kaynak_yil: int | None = None
+        kaynak_takvim = ""
+        miladi_yil: int | None = None
+
+        if miladi_raw is not None and str(miladi_raw).strip() != "":
+            miladi_yil = int(miladi_raw)
+            kaynak_yil = miladi_yil
+            kaynak_takvim = "Miladî"
+        elif rumi_raw is not None and str(rumi_raw).strip() != "":
+            kaynak_yil = int(rumi_raw)
+            cal = hicri_miladi_cevir(kaynak_yil)
+            miladi_yil = int(cal["rumi_ise_miladi"])
+            kaynak_takvim = "Rumî"
+        elif hicri_raw is not None and str(hicri_raw).strip() != "":
+            kaynak_yil = int(hicri_raw)
+            cal = hicri_miladi_cevir(kaynak_yil)
+            if takvim_hint == "rumi":
+                miladi_yil = int(cal["rumi_ise_miladi"])
+                kaynak_takvim = "Rumî"
+            else:
+                miladi_yil = int(cal["hicri_ise_miladi"])
+                kaynak_takvim = "Hicrî"
+        elif yil_raw is not None and str(yil_raw).strip() != "":
+            kaynak_yil = int(yil_raw)
+            if kaynak_yil < 1500 and takvim_hint != "miladi":
+                cal = hicri_miladi_cevir(kaynak_yil)
+                if takvim_hint == "rumi":
+                    miladi_yil = int(cal["rumi_ise_miladi"])
+                    kaynak_takvim = "Rumî"
+                else:
+                    miladi_yil = int(cal["hicri_ise_miladi"])
+                    kaynak_takvim = "Hicrî"
+            else:
+                miladi_yil = kaynak_yil
+                kaynak_takvim = "Miladî"
+
+        parsed.append({
+            "orig_index": idx,
+            "vilayet": vilayet,
+            "sancak": sancak,
+            "kaza": kaza,
+            "nahiye": nahiye,
+            "karye": karye,
+            "eski_ad": eski_ad,
+            "kisi": kisi,
+            "olay": olay,
+            "fon": fon,
+            "kaynak_yil": kaynak_yil,
+            "kaynak_takvim": kaynak_takvim,
+            "miladi_yil": miladi_yil,
+            "_sort_key": (0 if miladi_yil is not None else 1, miladi_yil if miladi_yil is not None else 999999, idx),
+        })
+
+    parsed.sort(key=lambda item: item["_sort_key"])
+
+    loc_map: dict[tuple[str, str, str], dict[str, object]] = {}
+    unique_locations: list[dict[str, object]] = []
+    timeline: list[dict[str, object]] = []
+    karye_admins: dict[str, list[dict[str, object]]] = {}
+
+    for step_no, item in enumerate(parsed, 1):
+        kaza = str(item["kaza"])
+        nahiye = str(item["nahiye"])
+        karye = str(item["karye"])
+        loc_key = (kaza.casefold(), nahiye.casefold(), karye.casefold())
+
+        if loc_key not in loc_map:
+            loc_id = f"L{len(unique_locations) + 1}"
+            variants: list[str] = []
+            if karye:
+                variants.extend(_generate_spelling_variants(karye))
+            if item["eski_ad"]:
+                for ev in _generate_spelling_variants(str(item["eski_ad"])):
+                    if ev not in variants:
+                        variants.append(ev)
+            loc_entry = {
+                "loc_id": loc_id,
+                "kaza": kaza,
+                "nahiye": nahiye,
+                "karye": karye,
+                "eski_ad": item["eski_ad"],
+                "years": [],
+                "fonlar": [],
+                "karye_variants": variants,
+            }
+            loc_map[loc_key] = loc_entry
+            unique_locations.append(loc_entry)
+        else:
+            loc_entry = loc_map[loc_key]
+            if item["eski_ad"] and not loc_entry["eski_ad"]:
+                loc_entry["eski_ad"] = item["eski_ad"]
+
+        if item["miladi_yil"] is not None and item["miladi_yil"] not in loc_entry["years"]:
+            loc_entry["years"].append(item["miladi_yil"])
+        if item["fon"] and item["fon"] not in loc_entry["fonlar"]:
+            loc_entry["fonlar"].append(item["fon"])
+
+        timeline_row = {k: v for k, v in item.items() if k != "_sort_key"}
+        timeline_row["step"] = step_no
+        timeline_row["loc_id"] = loc_entry["loc_id"]
+        timeline.append(timeline_row)
+
+        if karye:
+            karye_admins.setdefault(karye.casefold(), []).append({
+                "karye": karye,
+                "kaza": kaza,
+                "nahiye": nahiye,
+                "miladi_yil": item["miladi_yil"],
+                "loc_id": loc_entry["loc_id"],
+            })
+
+    transitions: list[dict[str, object]] = []
+    cross_references: list[dict[str, object]] = []
+    seen_edges: set[tuple[str, str, str]] = set()
+
+    for prev, curr in zip(timeline, timeline[1:]):
+        if prev["loc_id"] == curr["loc_id"]:
+            continue
+        same_village = (
+            bool(prev["karye"])
+            and bool(curr["karye"])
+            and str(prev["karye"]).casefold() == str(curr["karye"]).casefold()
+        )
+        t_type = "IDARI_BAG_DEGISIKLIGI" if same_village else "GOC_HAREKETI"
+        t_label = "İdari Bağ Değişikliği" if same_village else "Göç / Nakil"
+        y1 = prev["miladi_yil"]
+        y2 = curr["miladi_yil"]
+        if y1 is not None and y2 is not None:
+            year_span = f"{y1}->{y2}" if y1 != y2 else str(y2)
+        elif y2 is not None:
+            year_span = str(y2)
+        else:
+            year_span = "Tarihsiz"
+
+        edge_desc_parts = [year_span, t_label]
+        if curr["olay"]:
+            edge_desc_parts.append(str(curr["olay"]))
+        elif curr["fon"]:
+            edge_desc_parts.append(str(curr["fon"]))
+
+        transition = {
+            "from_loc_id": prev["loc_id"],
+            "to_loc_id": curr["loc_id"],
+            "type": t_type,
+            "label": t_label,
+            "from_year": y1,
+            "to_year": y2,
+            "from_place": " / ".join(x for x in [str(prev["kaza"]), str(prev["nahiye"]), str(prev["karye"])] if x),
+            "to_place": " / ".join(x for x in [str(curr["kaza"]), str(curr["nahiye"]), str(curr["karye"])] if x),
+            "edge_text": " : ".join(edge_desc_parts),
+        }
+        transitions.append(transition)
+
+    # Köy adı & idari bağ çapraz referansları
+    for _, occurrences in karye_admins.items():
+        distinct_admins = []
+        for occ in occurrences:
+            sig = (occ["kaza"], occ["nahiye"])
+            if sig not in distinct_admins:
+                distinct_admins.append(sig)
+        if len(distinct_admins) > 1:
+            cross_references.append({
+                "type": "IDARI_BAG_DEGISIKLIGI",
+                "karye": occurrences[0]["karye"],
+                "jurisdictions": [
+                    {"kaza": kz, "nahiye": nh} for kz, nh in distinct_admins
+                ],
+                "years": [occ["miladi_yil"] for occ in occurrences if occ["miladi_yil"] is not None],
+            })
+
+    for loc in unique_locations:
+        if loc["eski_ad"]:
+            cross_references.append({
+                "type": "ESKI_AD_ESLESMESI",
+                "karye": loc["karye"] or loc["kaza"],
+                "eski_ad": loc["eski_ad"],
+                "variants": loc["karye_variants"],
+            })
+
+    def _safe(text: object) -> str:
+        return str(text or "").replace('"', "'").replace("|", "/")
+
+    lines: list[str] = ["flowchart LR"]
+    for loc in unique_locations:
+        parts = [x for x in [str(loc["kaza"]), str(loc["nahiye"]), str(loc["karye"])] if x]
+        title = " / ".join(parts)
+        if loc["eski_ad"]:
+            title += f" (Eski: {loc['eski_ad']})"
+        if loc["years"]:
+            yrs = ", ".join(str(y) for y in loc["years"])
+            title += f" [{yrs}]"
+        lines.append(f'    {loc["loc_id"]}["{_safe(title)}"]')
+
+    for tr in transitions:
+        ekey = (str(tr["from_loc_id"]), str(tr["to_loc_id"]), str(tr["edge_text"]))
+        if ekey not in seen_edges:
+            seen_edges.add(ekey)
+            lines.append(f'    {tr["from_loc_id"]} -->|"{_safe(tr["edge_text"])}"| {tr["to_loc_id"]}')
+
+    mermaid_str = "\n".join(lines)
+
+    md_lines = [
+        "### Coğrafi Göç ve Köy / İdari Bağ Zaman Çizelgesi",
+        "",
+        "| Sıra | Yıl (Kaynak / Miladî) | Kaza | Nahiye | Karye / Mahalle | Eski Ad | Kişi / Olay / Fon |",
+        "|------|-----------------------|------|--------|-----------------|---------|-------------------|",
+    ]
+    for row in timeline:
+        if row["miladi_yil"] is not None and row["kaynak_yil"] is not None and row["kaynak_takvim"] != "Miladî":
+            yil_cell = f"{row['kaynak_takvim'][0]}.{row['kaynak_yil']} ({row['miladi_yil']})"
+        elif row["miladi_yil"] is not None:
+            yil_cell = str(row["miladi_yil"])
+        else:
+            yil_cell = "—"
+        detail_cell = " · ".join(x for x in [str(row["kisi"]), str(row["olay"]), str(row["fon"])] if x) or "—"
+        md_lines.append(
+            f"| {row['step']} | {yil_cell} | {row['kaza'] or '—'} | {row['nahiye'] or '—'} | "
+            f"{row['karye'] or '—'} | {row['eski_ad'] or '—'} | {detail_cell} |"
+        )
+
+    if cross_references:
+        md_lines.extend(["", "#### Köy Adı ve İdari Bağ Çapraz Başvuruları"])
+        for cr in cross_references:
+            if cr["type"] == "IDARI_BAG_DEGISIKLIGI":
+                chain = " -> ".join(f"{j['kaza']}/{j['nahiye'] or '—'}" for j in cr["jurisdictions"])
+                md_lines.append(f"- **{cr['karye']}** idari bağlılık değişimi: {chain}")
+            elif cr["type"] == "ESKI_AD_ESLESMESI":
+                md_lines.append(
+                    f"- **{cr['karye']}** (Eski Ad: *{cr['eski_ad']}*) katalog varyantları: "
+                    f"{', '.join(cr['variants'][:6])}"
+                )
+
+    md_lines.extend(["", "```mermaid", mermaid_str, "```"])
+    markdown_str = "\n".join(md_lines)
+
+    return {
+        "timeline": timeline,
+        "transitions": transitions,
+        "unique_locations": unique_locations,
+        "cross_references": cross_references,
+        "mermaid": mermaid_str,
+        "markdown": markdown_str,
+    }
+
+
+def cmd_migration_map(args: argparse.Namespace) -> None:
+    raw = (args.records_json or "").strip()
+    if not raw:
+        sys.exit("Hata: --records-json parametresi boş olamaz.")
+    candidate_path = Path(raw)
+    if candidate_path.is_file():
+        try:
+            payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            sys.exit(f"Hata: JSON dosyası okunamadı: {exc}")
+    else:
+        try:
+            payload = json.loads(raw)
+        except Exception as exc:
+            sys.exit(f"Hata: Geçersiz JSON girdisi: {exc}")
+
+    try:
+        res = trace_migration_timeline(payload)
+    except ValueError as exc:
+        sys.exit(f"Hata: {exc}")
+
+    print(res["markdown"])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Osmanlıca arşiv defteri varak ayırma ve 1:1 piksel kesit aracı.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -569,12 +871,13 @@ def main() -> None:
     p_lt.add_argument("--records-json", required=True, help="JSON dizisi veya JSON dosya yolu")
     p_lt.set_defaults(func=cmd_lineage_tree)
 
+    p_mm = sub.add_parser("migration-map", help="Kaza/nahiye/karye göç ve idari bağ kayıtlarından kronolojik zaman çizelgesi ve Mermaid flowchart LR diyagramı üretir.")
+    p_mm.add_argument("--records-json", required=True, help="JSON dizisi veya JSON dosya yolu")
+    p_mm.set_defaults(func=cmd_migration_map)
+
     args = parser.parse_args()
     args.func(args)
 
 
 if __name__ == "__main__":
     main()
-
-
-

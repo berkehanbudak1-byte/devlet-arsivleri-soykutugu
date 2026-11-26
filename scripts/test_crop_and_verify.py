@@ -1,10 +1,16 @@
 import json
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
-from crop_and_verify import build_archive_queries, build_lineage_mermaid, hicri_miladi_cevir
+from crop_and_verify import (
+    build_archive_queries,
+    build_lineage_mermaid,
+    hicri_miladi_cevir,
+    trace_migration_timeline,
+)
 
 
 class TestCropAndVerifyCalendar(unittest.TestCase):
@@ -108,8 +114,87 @@ class TestCropAndVerifyCalendar(unittest.TestCase):
         self.assertIn("1836", proc.stdout)
         self.assertIn("1861", proc.stdout)
 
+    def test_trace_migration_timeline_chronology_and_cross_references(self):
+        # Girdiler bilerek kronolojik olmayan sırada verilmiştir
+        records = [
+            {
+                "miladi_yil": 1924,
+                "kaza": "Çatalca",
+                "nahiye": "Merkez",
+                "karye": "İnceğiz",
+                "olay": "Mübadele İskânı",
+                "fon": "BCA 130.16.13.2",
+            },
+            {
+                "hicri_yil": 1260,
+                "kaza": "Serfice",
+                "nahiye": "Velvendos",
+                "karye": "Kozani",
+                "eski_ad": "Kozana",
+                "kisi": "Halil bin Mustafa",
+                "olay": "Temettuat Tahriri",
+                "fon": "ML.VRD.TMT.d",
+            },
+            {
+                "rumi_yil": 1293,
+                "kaza": "Manastır",
+                "nahiye": "Velvendos",
+                "karye": "Kozani",
+                "eski_ad": "Kozana",
+                "olay": "Kaza bağ değişikliği",
+                "fon": "NFS.d",
+            },
+        ]
+        res = trace_migration_timeline(records)
+        self.assertEqual([r["miladi_yil"] for r in res["timeline"]], [1844, 1877, 1924])
+        self.assertEqual(len(res["unique_locations"]), 3)
+        self.assertEqual(len(res["transitions"]), 2)
+        self.assertEqual(res["transitions"][0]["type"], "IDARI_BAG_DEGISIKLIGI")
+        self.assertEqual(res["transitions"][1]["type"], "GOC_HAREKETI")
+        self.assertTrue(any(cr["type"] == "IDARI_BAG_DEGISIKLIGI" and cr["karye"] == "Kozani" for cr in res["cross_references"]))
+        self.assertTrue(any(cr["type"] == "ESKI_AD_ESLESMESI" and cr["eski_ad"] == "Kozana" for cr in res["cross_references"]))
+        self.assertTrue(res["mermaid"].startswith("flowchart LR"))
+        self.assertIn("L1 -->|\"", res["mermaid"])
+        self.assertIn("L2 -->|\"", res["mermaid"])
+        self.assertIn("```mermaid", res["markdown"])
+
+    def test_trace_migration_timeline_validation(self):
+        with self.assertRaises(ValueError):
+            trace_migration_timeline([])
+        with self.assertRaises(ValueError):
+            trace_migration_timeline([{"miladi_yil": 1850}])
+
+    def test_cli_migration_map_command(self):
+        script = Path(__file__).parent / "crop_and_verify.py"
+        sample = [
+            {"hicri_yil": 1260, "kaza": "Üsküdar", "nahiye": "Kartal", "karye": "Yakacık", "fon": "ML.VRD.TMT.d"},
+            {"miladi_yil": 1882, "kaza": "Kartal", "nahiye": "Merkez", "karye": "Yakacık", "fon": "NFS.d"},
+        ]
+        payload = json.dumps(sample)
+        proc = subprocess.run(
+            [sys.executable, str(script), "migration-map", "--records-json", payload],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("flowchart LR", proc.stdout)
+        self.assertIn("Yakacık", proc.stdout)
+        self.assertIn("1844", proc.stdout)
+
+        with tempfile.NamedTemporaryFile("w", suffix=".json", encoding="utf-8", delete=False) as tmp:
+            tmp.write(payload)
+            tmp_path = Path(tmp.name)
+        try:
+            proc_file = subprocess.run(
+                [sys.executable, str(script), "migration-map", "--records-json", str(tmp_path)],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            self.assertIn("flowchart LR", proc_file.stdout)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
 
 if __name__ == "__main__":
     unittest.main()
-
-
