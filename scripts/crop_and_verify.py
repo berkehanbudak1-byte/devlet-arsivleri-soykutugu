@@ -151,6 +151,60 @@ def cmd_crop(args: argparse.Namespace) -> None:
         print(f"1:1 Kanıt Kesiti Kaydedildi: {out_path} ({crop.width}x{crop.height} px, kaynak kutu=({x1},{y1},{x2},{y2}))")
 
 
+def hicri_miladi_cevir(year: int) -> dict[str, int | str]:
+    """
+    Osmanlı Nüfus, Temettuat ve Tapu tahrir defterlerindeki Hicrî (Kamerî) ve
+    Rumî (Malî) yılları Miladî (Gregoryen) yıla çevirir.
+    - Hicrî -> Miladî: M ≈ H - floor(H / 33) + 622 (veya H * 0.970224 + 621.57)
+    - Rumî  -> Miladî: M = R + 584 (1 Mart başlangıçlı malî yıl; Ocak-Şubat +585)
+    """
+    if year <= 0:
+        raise ValueError("Yıl pozitif bir tam sayı olmalıdır.")
+    hicri_to_miladi = int(round(year * 0.970224 + 621.57))
+    rumi_to_miladi = year + 584
+    if year < 1500:
+        donem_notu = (
+            f"1246-1261 (1830-1845) İlk Nüfus/Temettuat dönemi"
+            if 1240 <= year <= 1265
+            else "1293-1324 (1877-1908) Sicill-i Nüfus / İkinci Tahrir dönemi"
+            if 1280 <= year <= 1335
+            else "Osmanlı Arşiv Dönemi"
+        )
+    else:
+        donem_notu = "Miladî yıl girdisi (geriye dönüşüm için Hicrî ≈ M - 622 + floor((M - 622)/32))"
+    return {
+        "girdi_yili": year,
+        "hicri_ise_miladi": hicri_to_miladi,
+        "hicri_aralik": f"{hicri_to_miladi - 1}/{hicri_to_miladi}",
+        "rumi_ise_miladi": rumi_to_miladi,
+        "rumi_mart_subat_aralik": f"{rumi_to_miladi}/{rumi_to_miladi + 1}",
+        "donem_notu": donem_notu,
+    }
+
+
+def cmd_calendar(args: argparse.Namespace) -> None:
+    try:
+        info = hicri_miladi_cevir(args.year)
+    except ValueError as exc:
+        sys.exit(f"Hata: {exc}")
+    if getattr(args, "birth_age", None) is not None:
+        age = int(args.birth_age)
+        b_hicri = info["hicri_ise_miladi"] - age
+        b_rumi = info["rumi_ise_miladi"] - age
+        info["tahmini_dogum_miladi_hicriye_gore"] = b_hicri
+        info["tahmini_dogum_miladi_rumiye_gore"] = b_rumi
+    print(f"=== Osmanlı Arşiv Takvim Dönüşümü (Yıl: {info['girdi_yili']}) ===")
+    print(f"  Hicrî {info['girdi_yili']}  -> Miladî {info['hicri_ise_miladi']} ({info['hicri_aralik']})")
+    print(f"  Rumî  {info['girdi_yili']}  -> Miladî {info['rumi_ise_miladi']} (Mart-Şubat: {info['rumi_mart_subat_aralik']})")
+    print(f"  Dönem Notu : {info['donem_notu']}")
+    if "tahmini_dogum_miladi_hicriye_gore" in info:
+        print(
+            f"  Yaş ({args.birth_age}) -> Tahmini Doğum: "
+            f"Hicrî deftere göre ~{info['tahmini_dogum_miladi_hicriye_gore']}, "
+            f"Rumî deftere göre ~{info['tahmini_dogum_miladi_rumiye_gore']}"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Osmanlıca arşiv defteri varak ayırma ve 1:1 piksel kesit aracı.")
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -174,9 +228,15 @@ def main() -> None:
     p_crp.add_argument("--nearest", action="store_true", help="Harf noktalarını keskin görmek için piksel (NEAREST) büyütme kullan")
     p_crp.set_defaults(func=cmd_crop)
 
+    p_cal = sub.add_parser("calendar", help="Hicrî veya Rumî defter yılını Miladî yıla çevirir (örn. --year 1293).")
+    p_cal.add_argument("--year", type=int, required=True, help="Defterdeki Hicrî veya Rumî yıl (örn. 1260, 1293, 1320)")
+    p_cal.add_argument("--birth-age", type=int, default=None, help="Defterde yazan yaş (`sinn`) ile tahmini doğum yılını hesapla")
+    p_cal.set_defaults(func=cmd_calendar)
+
     args = parser.parse_args()
     args.func(args)
 
 
 if __name__ == "__main__":
     main()
+
