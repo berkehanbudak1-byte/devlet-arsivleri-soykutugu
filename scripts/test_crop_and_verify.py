@@ -1,9 +1,10 @@
+import json
 import subprocess
 import sys
 import unittest
 from pathlib import Path
 
-from crop_and_verify import build_archive_queries, hicri_miladi_cevir
+from crop_and_verify import build_archive_queries, build_lineage_mermaid, hicri_miladi_cevir
 
 
 class TestCropAndVerifyCalendar(unittest.TestCase):
@@ -73,7 +74,42 @@ class TestCropAndVerifyCalendar(unittest.TestCase):
         self.assertIn("Uskudar", proc.stdout)
         self.assertIn("1839-1849", proc.stdout)
 
+    def test_build_lineage_mermaid_pedigree_and_birth_years(self):
+        sample_records = [
+            {"hane": 14, "isim": "Halil", "baba_adi": "Mustafa", "yas": 52, "hicri_yil": 1260},
+            {"hane": 14, "isim": "Mehmed", "baba_adi": "Halil", "yas": 24, "hicri_yil": 1260},
+            {"hane": 14, "isim": "Ali", "baba_adi": "Halil", "yas": 18, "hicri_yil": 1260},
+        ]
+        res = build_lineage_mermaid(sample_records)
+        self.assertEqual(len(res["records"]), 3)
+        # 1260 Hicri -> 1844 Miladi; Halil (52) -> 1792, Mehmed (24) -> 1820, Ali (18) -> 1826
+        self.assertEqual(res["records"][0]["dogum_miladi_hicri"], 1792)
+        self.assertEqual(res["records"][1]["dogum_miladi_hicri"], 1820)
+        self.assertEqual(res["records"][2]["dogum_miladi_hicri"], 1826)
+        self.assertIn("flowchart TD", res["mermaid"])
+        self.assertIn("A1 --> P1", res["mermaid"])
+        self.assertIn("P1 --> P2", res["mermaid"])
+        self.assertIn("P1 --> P3", res["mermaid"])
+        self.assertIn("```mermaid", res["markdown"])
+
+    def test_cli_lineage_tree_command(self):
+        script = Path(__file__).parent / "crop_and_verify.py"
+        payload = json.dumps([
+            {"hane": 7, "isim": "Osman", "baba_adi": "İbrahim", "yas": 40, "hicri_yil": 1293},
+            {"hane": 7, "isim": "Hasan", "baba_adi": "Osman", "yas": 15, "hicri_yil": 1293},
+        ])
+        proc = subprocess.run(
+            [sys.executable, str(script), "lineage-tree", "--records-json", payload],
+            capture_output=True,
+            text=True,
+            check=True,
+        )
+        self.assertIn("flowchart TD", proc.stdout)
+        self.assertIn("1836", proc.stdout)
+        self.assertIn("1861", proc.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
