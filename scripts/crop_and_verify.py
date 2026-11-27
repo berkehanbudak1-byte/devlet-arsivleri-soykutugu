@@ -21,13 +21,17 @@ import json
 import math
 import os
 import re
+import stat
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-# Güvenlik sınırları (decompression bomb / zip bomb / çıktı boyut koruması)
-MAX_IMAGE_PIXELS = 100_000_000  # 100 MP üst sınır
+# Güvenlik sınırları (Upload2Shell / decompression bomb / zip bomb / çıktı boyut koruması)
+MAX_IMAGE_PIXELS = 16_000_000  # 16 MP üst sınır (decompression bomb ve bellek tavanı)
+ALLOWED_IMAGE_FORMATS = ("PNG", "JPEG", "WEBP", "TIFF")  # EPS/PostScript (Ghostscript) delegasyonunu engeller
+MAX_IMAGE_BYTES = 25 * 1024 * 1024  # 25 MB ham görsel bayt tavanı (kayıpsız 16 MP arşiv TIFF/taramalar dahil)
+FORBIDDEN_IMAGE_SIGNATURES = (b"%!PS", b"\xc5\xd0\xd3\xc6", b"%PDF")  # PostScript/EPS (ASCII & ikili) ve PDF
 
 MAX_ZIP_FILES = 2000
 MAX_ZIP_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB toplam açılmış boyut sınırı
@@ -147,32 +151,139 @@ def validate_safe_path(
     return resolved
 
 
+def validate_image_magic_bytes(data: bytes | bytearray, source_label: str = "") -> None:
+    """
+    Ham görüntü başlığında Upload2Shell (CVE-2026-125396) riskine yol açan
+    PostScript/EPS (ASCII ve ikili) veya PDF sihirli baytlarını Pillow
+    yüklenmeden önce saf stdlib ile reddeder.
+    """
+    label = f" ({source_label})" if source_label else ""
+    if not isinstance(data, (bytes, bytearray)):
+        raise ValueError(f"Görüntü verisi bayt dizisi olmalıdır{label}.")
+    raw = bytes(data)
+    if not raw:
+        raise ValueError(f"Boş görüntü verisi reddedildi{label}.")
+    stripped = raw.lstrip(b" \t\r\n\x0b\x0c\x00")
+    if not stripped:
+        raise ValueError(f"Geçersiz veya yalnızca boşluk/NUL içeren görüntü verisi reddedildi{label}.")
+    if stripped.startswith(FORBIDDEN_IMAGE_SIGNATURES):
+        raise ValueError(
+            f"Güvenlik nedeniyle yasaklı görüntü başlığı (PostScript/EPS/PDF) reddedildi{label}."
+        )
+
+
+def _validate_image_file_header(img_path: Path, *, max_bytes: int = MAX_IMAGE_BYTES) -> None:
+    """
+    Görüntü dosyasının normal dosya varlığını, bayt üst sınırını ve ilk 4096
+    bayttaki sihirli baytları Pillow çağrılmadan önce saf stdlib ile doğrular.
+    """
+    if isinstance(max_bytes, bool) or not isinstance(max_bytes, int) or max_bytes <= 0:
+        raise ValueError("max_bytes pozitif bir tam sayı olmalıdır.")
+    path = Path(img_path)
+    try:
+        st = path.stat()
+    except OSError as exc:
+        raise ValueError(f"Görüntü dosyası bulunamadı veya okunamadı ({path.name}): {exc}") from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise ValueError(f"Görüntü yolu normal bir dosya olmalıdır: {path.name}")
+    if st.st_size <= 0:
+        raise ValueError(f"Boş görüntü dosyası reddedildi: {path.name}")
+    if st.st_size > max_bytes:
+        raise ValueError(
+            f"Görüntü dosya boyutu ({st.st_size} B) izin verilen üst sınırı ({max_bytes} B) aşıyor: {path.name}"
+        )
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(4096)
+    except OSError as exc:
+        raise ValueError(f"Görüntü başlığı okunamadı ({path.name}): {exc}") from exc
+    validate_image_magic_bytes(head, str(path.name))
+
+
+def _harden_pillow(pil_image: Any) -> Any:
+    """
+    Pillow piksel tavanını (16 MP) uygular ve Upload2Shell (CVE-2026-125396)
+    riskine karşı Ghostscript delegasyonu yapan EPS eklentisini kapatır.
+    """
+    pil_image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    pil_image.init()
+    pil_image.OPEN.pop("EPS", None)
+    while "EPS" in pil_image.ID:
+        pil_image.ID.remove("EPS")
+    return pil_image
+
+
 def _require_pil_image() -> Any:
-    """Pillow (PIL.Image) modülünü yalnızca görüntü komutlarında tembel (lazy) yükler."""
+    """Pillow (PIL.Image) modülünü yalnızca görüntü komutlarında tembel (lazy) yükler ve sertleştirir."""
     try:
         from PIL import Image as pil_image
     except ImportError:
         sys.exit("Hata: 'Pillow' kütüphanesi kurulu değil. Kurmak için: pip install Pillow")
-    pil_image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
-    return pil_image
+    return _harden_pillow(pil_image)
 
 
-def open_image_safely(img_path: Path) -> Any:
-    """Görüntüyü decompression bomb koruması (Image.MAX_IMAGE_PIXELS) etkin biçimde açar."""
+def open_image_safely(
+    img_path: Path,
+    *,
+    max_pixels: int | None = None,
+    max_bytes: int = MAX_IMAGE_BYTES,
+) -> Any:
+    """
+    Görüntüyü Upload2Shell (CVE-2026-125396) ve decompression bomb koruması
+    etkin biçimde (magic-byte + boyut + format izin listesi + 16 MP tavan + load) açar.
+    """
+    if max_pixels is None:
+        limit = MAX_IMAGE_PIXELS
+    else:
+        if isinstance(max_pixels, bool) or not isinstance(max_pixels, int) or max_pixels <= 0:
+            raise ValueError("max_pixels pozitif bir tam sayı olmalıdır.")
+        limit = min(int(max_pixels), MAX_IMAGE_PIXELS)
+
+    path = Path(img_path)
+    _validate_image_file_header(path, max_bytes=max_bytes)
+
     pil_image = _require_pil_image()
-    pil_image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    from PIL import UnidentifiedImageError
+
     try:
-        im = pil_image.open(img_path)
+        im = pil_image.open(path, formats=ALLOWED_IMAGE_FORMATS)
     except pil_image.DecompressionBombError as exc:
         raise ValueError(
-            f"Görüntü piksel üst sınırını ({MAX_IMAGE_PIXELS} px) aşıyor (decompression bomb koruması): {exc}"
+            f"Görüntü piksel üst sınırını ({limit} px) aşıyor (decompression bomb koruması): {exc}"
         ) from exc
-    if im.width * im.height > MAX_IMAGE_PIXELS:
-        pixels = im.width * im.height
-        im.close()
+    except UnidentifiedImageError as exc:
         raise ValueError(
-            f"Görüntü piksel üst sınırını ({pixels} > {MAX_IMAGE_PIXELS} px) aşıyor (decompression bomb koruması)."
-        )
+            f"Desteklenmeyen veya geçersiz görüntü formatı ({path.name}); yalnızca {', '.join(ALLOWED_IMAGE_FORMATS)} desteklenir."
+        ) from exc
+    except OSError as exc:
+        raise ValueError(f"Görüntü dosyası açılamadı ({path.name}): {exc}") from exc
+
+    try:
+        fmt = getattr(im, "format", None)
+        if fmt is not None and str(fmt).upper() not in ALLOWED_IMAGE_FORMATS:
+            raise ValueError(
+                f"Desteklenmeyen veya geçersiz görüntü formatı ({fmt}); yalnızca {', '.join(ALLOWED_IMAGE_FORMATS)} desteklenir."
+            )
+        pixels = im.width * im.height
+        if pixels > limit:
+            raise ValueError(
+                f"Görüntü piksel üst sınırını ({pixels} > {limit} px) aşıyor (decompression bomb koruması)."
+            )
+        try:
+            im.load()
+        except pil_image.DecompressionBombError as exc:
+            raise ValueError(
+                f"Görüntü piksel üst sınırını ({limit} px) aşıyor (decompression bomb koruması): {exc}"
+            ) from exc
+        except UnidentifiedImageError as exc:
+            raise ValueError(
+                f"Desteklenmeyen veya geçersiz görüntü formatı ({path.name}); yalnızca {', '.join(ALLOWED_IMAGE_FORMATS)} desteklenir."
+            ) from exc
+        except OSError as exc:
+            raise ValueError(f"Görüntü verisi çözümlenemedi ({path.name}): {exc}") from exc
+    except Exception:
+        im.close()
+        raise
     return im
 
 
@@ -301,10 +412,18 @@ def extract_zips_if_needed(input_dir: Path, extract_root: Path) -> list[Path]:
                             if member.is_dir():
                                 dest.mkdir(parents=True, exist_ok=True)
                             else:
+                                is_image_member = Path(normalized_posix).suffix.lower() in IMAGE_EXTS
+                                if is_image_member and member.file_size > MAX_IMAGE_BYTES:
+                                    raise ValueError(
+                                        f"ZIP içindeki görüntü boyut sınırını ({MAX_IMAGE_BYTES} B) aşıyor: {raw_member_name}"
+                                    )
+                                min_magic_len = max(len(sig) for sig in FORBIDDEN_IMAGE_SIGNATURES)
                                 dest.parent.mkdir(parents=True, exist_ok=True)
                                 try:
                                     with zf.open(member, "r") as src_fh, open(dest, "wb") as dst_fh:
                                         written = 0
+                                        header_buf = bytearray()
+                                        header_validated = False
                                         while True:
                                             chunk = src_fh.read(65536)
                                             if not chunk:
@@ -315,11 +434,25 @@ def extract_zips_if_needed(input_dir: Path, extract_root: Path) -> list[Path]:
                                                 raise ValueError(
                                                     f"ZIP üyesi gerçek boyut sınırını aşıyor: {raw_member_name}"
                                                 )
+                                            if is_image_member and written > MAX_IMAGE_BYTES:
+                                                raise ValueError(
+                                                    f"ZIP içindeki görüntü gerçek boyut sınırını ({MAX_IMAGE_BYTES} B) aşıyor: {raw_member_name}"
+                                                )
                                             if actual_total_written > MAX_ZIP_TOTAL_BYTES:
                                                 raise ValueError(
                                                     f"ZIP toplam gerçek açılmış boyut sınırını ({MAX_ZIP_TOTAL_BYTES} B) aşıyor: {fpath.name}"
                                                 )
+                                            if is_image_member and not header_validated:
+                                                remaining = 4096 - len(header_buf)
+                                                if remaining > 0:
+                                                    header_buf.extend(chunk[:remaining])
+                                                stripped = bytes(header_buf).lstrip(b" \t\r\n\x0b\x0c\x00")
+                                                if len(stripped) >= min_magic_len or len(header_buf) >= 4096:
+                                                    validate_image_magic_bytes(header_buf, normalized_posix)
+                                                    header_validated = True
                                             dst_fh.write(chunk)
+                                        if is_image_member and not header_validated:
+                                            validate_image_magic_bytes(header_buf, normalized_posix)
                                 except Exception:
                                     dest.unlink(missing_ok=True)
                                     raise

@@ -8,21 +8,27 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, _SCRIPTS_DIR)
 
+import crop_and_verify
 from crop_and_verify import (
+    ALLOWED_IMAGE_FORMATS,
+    FORBIDDEN_IMAGE_SIGNATURES,
     MAX_CROP_ZOOM,
+    MAX_IMAGE_BYTES,
     MAX_IMAGE_PIXELS,
     MAX_OUTPUT_DIMENSION,
     _escape_mermaid_label,
+    _harden_pillow,
     _require_pil_image,
     build_archive_queries,
     build_lineage_mermaid,
@@ -35,6 +41,7 @@ from crop_and_verify import (
     sanitize_markdown_cell,
     sanitize_mermaid_label,
     trace_migration_timeline,
+    validate_image_magic_bytes,
     validate_safe_path,
     verify_citations,
 )
@@ -226,30 +233,256 @@ class TestCropAndVerifyCalendar(unittest.TestCase):
 class TestCropAndVerifySecurity(unittest.TestCase):
     def test_decompression_bomb_limit_configured_and_enforced(self):
         pil_image = _require_pil_image()
-        self.assertEqual(pil_image.MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS)
-        self.assertGreater(MAX_IMAGE_PIXELS, 0)
-        self.assertLessEqual(MAX_IMAGE_PIXELS, 100_000_000)
+        self.assertEqual(MAX_IMAGE_PIXELS, 16_000_000)
+        self.assertEqual(pil_image.MAX_IMAGE_PIXELS, 16_000_000)
+        self.assertNotIn("EPS", pil_image.OPEN)
+        self.assertNotIn("EPS", pil_image.ID)
 
-        with patch("PIL.Image.open", side_effect=Image.DecompressionBombError("bomb")):
-            with self.assertRaises(ValueError) as ctx:
-                open_image_safely(Path("dummy.png"))
-        self.assertIn("decompression bomb", str(ctx.exception).lower())
+        with tempfile.TemporaryDirectory() as td:
+            sample_png = Path(td) / "sample.png"
+            Image.new("RGB", (20, 20), color=(180, 160, 120)).save(sample_png, format="PNG")
 
-        # Also enforce strict MAX_IMAGE_PIXELS ceiling even between 1x and 2x (where Pillow only warns)
-        class _OversizedStub:
-            width = 11_000
-            height = 10_000
-            closed = False
+            with patch("PIL.Image.open", side_effect=Image.DecompressionBombError("bomb")):
+                with self.assertRaises(ValueError) as ctx:
+                    open_image_safely(sample_png)
+            self.assertIn("decompression bomb", str(ctx.exception).lower())
 
-            def close(self):
-                self.closed = True
+            # Also enforce strict MAX_IMAGE_PIXELS ceiling even between 1x and 2x (where Pillow only warns)
+            class _OversizedStub:
+                width = 11_000
+                height = 10_000
+                closed = False
+                loaded = False
 
-        stub = _OversizedStub()
-        with patch("PIL.Image.open", return_value=stub):
-            with self.assertRaises(ValueError) as ctx2:
-                open_image_safely(Path("oversized.png"))
-        self.assertTrue(stub.closed)
-        self.assertIn("decompression bomb", str(ctx2.exception).lower())
+                def load(self):
+                    self.loaded = True
+
+                def close(self):
+                    self.closed = True
+
+            stub = _OversizedStub()
+            with patch("PIL.Image.open", return_value=stub):
+                with self.assertRaises(ValueError) as ctx2:
+                    open_image_safely(sample_png)
+            self.assertTrue(stub.closed)
+            self.assertFalse(stub.loaded)
+            self.assertIn("decompression bomb", str(ctx2.exception).lower())
+
+            # Real non-mocked decompression bomb enforcement: >2x and 1x..2x warning band
+            with self.assertRaises(ValueError) as ctx_over_2x:
+                open_image_safely(sample_png, max_pixels=100)
+            self.assertIn("decompression bomb", str(ctx_over_2x.exception).lower())
+
+            with self.assertRaises(ValueError) as ctx_band_1x_2x:
+                open_image_safely(sample_png, max_pixels=250)
+            self.assertIn("decompression bomb", str(ctx_band_1x_2x.exception).lower())
+
+            for bad_limit in (0, -1, True, False):
+                with self.assertRaises(ValueError):
+                    open_image_safely(sample_png, max_pixels=bad_limit)
+
+            # Real 20 MP (1x..2x warning band of 16 MP) and 36 MP (>2x) 1-bit PNGs rejected without mocks
+            png_20mp = Path(td) / "bomb_20mp.png"
+            Image.new("1", (5000, 4000), 0).save(png_20mp, format="PNG")
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+                with self.assertRaises(ValueError) as ctx_20mp:
+                    open_image_safely(png_20mp)
+            self.assertIn("decompression bomb", str(ctx_20mp.exception).lower())
+
+            png_36mp = Path(td) / "bomb_36mp.png"
+            Image.new("1", (6000, 6000), 0).save(png_36mp, format="PNG")
+            with self.assertRaises(ValueError) as ctx_36mp:
+                open_image_safely(png_36mp)
+            self.assertIn("decompression bomb", str(ctx_36mp.exception).lower())
+
+    def test_upload2shell_pillow_eps_disabled_and_allowed_formats(self):
+        self.assertEqual(ALLOWED_IMAGE_FORMATS, ("PNG", "JPEG", "WEBP", "TIFF"))
+        self.assertEqual(MAX_IMAGE_BYTES, 25 * 1024 * 1024)
+        self.assertEqual(FORBIDDEN_IMAGE_SIGNATURES, (b"%!PS", b"\xc5\xd0\xd3\xc6", b"%PDF"))
+
+        pil_image = _require_pil_image()
+        self.assertNotIn("EPS", pil_image.OPEN)
+        self.assertNotIn("EPS", pil_image.ID)
+
+        # Bare PIL.Image.open must also refuse EPS after hardening
+        eps_ascii = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 1 1\nshowpage\n"
+        with self.assertRaises(UnidentifiedImageError):
+            Image.open(io.BytesIO(eps_ascii))
+
+        # _harden_pillow strips duplicate EPS entries cleanly
+        class _FakePil:
+            MAX_IMAGE_PIXELS = None
+            OPEN = {"PNG": object(), "EPS": object()}
+            ID = ["EPS", "PNG", "EPS", "JPEG"]
+            inited = False
+
+            @classmethod
+            def init(cls):
+                cls.inited = True
+
+        _harden_pillow(_FakePil)
+        self.assertTrue(_FakePil.inited)
+        self.assertEqual(_FakePil.MAX_IMAGE_PIXELS, 16_000_000)
+        self.assertNotIn("EPS", _FakePil.OPEN)
+        self.assertNotIn("EPS", _FakePil.ID)
+
+        # Valid PNG, JPEG, WEBP, and TIFF archival images open cleanly
+        with tempfile.TemporaryDirectory() as td:
+            for ext, fmt in (
+                (".png", "PNG"),
+                (".jpg", "JPEG"),
+                (".webp", "WEBP"),
+                (".tiff", "TIFF"),
+            ):
+                p = Path(td) / f"varak{ext}"
+                Image.new("RGB", (24, 16), color=(90, 110, 130)).save(p, format=fmt)
+                with open_image_safely(p) as im:
+                    self.assertEqual(im.size, (24, 16))
+                    self.assertEqual(im.format, fmt)
+
+    def test_open_image_safely_rejects_eps_ps_pdf_gif_empty_and_oversized(self):
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            forbidden_payloads = {
+                "ascii_eps.jpg": b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 1 1\nshowpage\n",
+                "ws_eps.png": b" \t\r\n%!PS-Adobe-3.0\nshowpage\n",
+                "nul_eps.jpg": b"\x00\x00%!PS-Adobe-3.0\nshowpage\n",
+                "binary_epsf.tiff": b"\xc5\xd0\xd3\xc6" + b"\x00" * 28,
+                "pdf_disguised.jpg": b"%PDF-1.7\n1 0 obj\n<<>>\nendobj\n",
+                "empty.png": b"",
+                "whitespace_only.png": b"   \n\x00\t",
+            }
+            for fname, payload in forbidden_payloads.items():
+                fp = td_path / fname
+                fp.write_bytes(payload)
+                with self.assertRaises(ValueError, msg=f"{fname} reddedilmeli"):
+                    open_image_safely(fp)
+
+            # Disguised GIF saved with .png extension rejected by format allowlist
+            gif_as_png = td_path / "disguised_gif.png"
+            Image.new("RGB", (16, 16), color=(255, 0, 0)).save(gif_as_png, format="GIF")
+            with self.assertRaises(ValueError) as ctx_gif:
+                open_image_safely(gif_as_png)
+            self.assertIn("format", str(ctx_gif.exception).lower())
+
+            # Exceeding max_bytes rejected before Pillow decode
+            valid_png = td_path / "valid.png"
+            Image.new("RGB", (32, 32), color=(40, 80, 120)).save(valid_png, format="PNG")
+            self.assertGreater(valid_png.stat().st_size, 16)
+            with self.assertRaises(ValueError):
+                open_image_safely(valid_png, max_bytes=16)
+
+            for bad_max_bytes in (0, -5, True, False):
+                with self.assertRaises(ValueError):
+                    open_image_safely(valid_png, max_bytes=bad_max_bytes)
+
+            # Missing file and directory path rejected with ValueError
+            with self.assertRaises(ValueError):
+                open_image_safely(td_path / "missing.png")
+            with self.assertRaises(ValueError):
+                open_image_safely(td_path)
+
+        # Direct magic-byte validator edge cases
+        for invalid in ("not-bytes", None, 123, b"", bytearray(), b" \x00\n", b"%!PS", b"\xc5\xd0\xd3\xc6", b"%PDF"):
+            with self.assertRaises(ValueError):
+                validate_image_magic_bytes(invalid)  # type: ignore[arg-type]
+        validate_image_magic_bytes(bytearray(b"\x89PNG\r\n\x1a\n"))
+
+    def test_extract_zips_rejects_disguised_eps_pdf_and_oversized_images_with_cleanup(self):
+        disguised_cases = [
+            ("eps_ascii", "varak.jpg", b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 1 1\nshowpage\n"),
+            ("eps_ws_nul", "sub/varak.png", b" \n\x00%!PS-Adobe-3.0\nshowpage\n"),
+            ("eps_binary", "varak.tif", b"\xc5\xd0\xd3\xc6" + b"\x00" * 28),
+            ("pdf_magic", "varak.webp", b"  \n%PDF-1.7\n%fake\n"),
+            ("empty_img", "empty.jpg", b""),
+        ]
+        for case_name, arcname, payload in disguised_cases:
+            with tempfile.TemporaryDirectory() as td:
+                in_dir = Path(td) / "in"
+                out_dir = Path(td) / "out"
+                in_dir.mkdir()
+                zpath = in_dir / f"{case_name}.zip"
+                with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED) as zf:
+                    zf.writestr(arcname, payload)
+                with self.assertRaises(ValueError, msg=f"{case_name} reddedilmeli"):
+                    extract_zips_if_needed(in_dir, out_dir)
+                expected_dest = out_dir / case_name / arcname
+                self.assertFalse(expected_dest.exists(), f"Kısmi dosya temizlenmedi: {expected_dest}")
+
+        # Oversized image member (> MAX_IMAGE_BYTES) rejected and cleaned up
+        with tempfile.TemporaryDirectory() as td:
+            in_dir = Path(td) / "in"
+            out_dir = Path(td) / "out"
+            in_dir.mkdir()
+            png_buf = io.BytesIO()
+            Image.new("RGB", (64, 64), color=(10, 20, 30)).save(png_buf, format="PNG")
+            png_bytes = png_buf.getvalue()
+            self.assertGreater(len(png_bytes), 64)
+
+            zpath = in_dir / "oversized_img.zip"
+            with zipfile.ZipFile(zpath, "w", compression=zipfile.ZIP_STORED) as zf:
+                zf.writestr("big_varak.png", png_bytes)
+
+            with patch.object(crop_and_verify, "MAX_IMAGE_BYTES", 64):
+                with self.assertRaises(ValueError):
+                    extract_zips_if_needed(in_dir, out_dir)
+            self.assertFalse((out_dir / "oversized_img" / "big_varak.png").exists())
+
+            # Legitimate non-image .pdf companion file inside ZIP must not trigger false positive
+            zpath.unlink()
+            valid_zip = in_dir / "with_notes.zip"
+            with zipfile.ZipFile(valid_zip, "w", compression=zipfile.ZIP_STORED) as zf:
+                zf.writestr("notes.pdf", b"%PDF-1.7\n%legitimate metadata doc\n")
+                zf.writestr("page_01.png", png_bytes)
+            extracted = extract_zips_if_needed(in_dir, out_dir / "ok")
+            self.assertEqual([p.name for p in extracted], ["page_01.png"])
+
+    def test_cli_inventory_split_crop_reject_disguised_eps_pdf_cleanly(self):
+        script = Path(__file__).parent / "crop_and_verify.py"
+        eps_payload = b"%!PS-Adobe-3.0 EPSF-3.0\n%%BoundingBox: 0 0 1 1\nshowpage\n"
+        pdf_payload = b"%PDF-1.7\n%disguised\n"
+
+        with tempfile.TemporaryDirectory() as td:
+            td_path = Path(td)
+            eps_jpg = td_path / "disguised_eps.jpg"
+            eps_jpg.write_bytes(eps_payload)
+            pdf_jpg = td_path / "disguised_pdf.jpg"
+            pdf_jpg.write_bytes(pdf_payload)
+
+            inv_dir = td_path / "inv_in"
+            inv_dir.mkdir()
+            (inv_dir / "varak.jpg").write_bytes(eps_payload)
+
+            zip_dir = td_path / "zip_in"
+            zip_dir.mkdir()
+            with zipfile.ZipFile(zip_dir / "paket.zip", "w", compression=zipfile.ZIP_STORED) as zf:
+                zf.writestr("varak.jpg", pdf_payload)
+
+            commands = [
+                ["inventory", "--input", str(inv_dir), "--output", str(td_path / "inv_out")],
+                ["inventory", "--input", str(zip_dir), "--output", str(td_path / "zip_out")],
+                ["split", "--image", str(eps_jpg), "--output", str(td_path / "split_out")],
+                [
+                    "crop",
+                    "--image",
+                    str(pdf_jpg),
+                    "--box",
+                    "0.1,0.1,0.5,0.5",
+                    "--output",
+                    str(td_path / "crop_out.png"),
+                ],
+            ]
+            for cli_args in commands:
+                proc = subprocess.run(
+                    [sys.executable, "-B", str(script), *cli_args],
+                    capture_output=True,
+                    text=True,
+                )
+                combined = proc.stdout + proc.stderr
+                self.assertNotEqual(proc.returncode, 0, f"Beklenen red gerçekleşmedi: {cli_args}")
+                self.assertIn("Hata:", combined, f"Temiz 'Hata:' mesajı yok: {combined!r}")
+                self.assertNotIn("Traceback", combined, f"Ham Python traceback sızdı: {combined!r}")
 
     def test_sanitize_filename_strips_traversal_and_unsafe_chars(self):
         self.assertEqual(sanitize_filename("../../etc/passwd"), "etc_passwd")
@@ -567,6 +800,23 @@ console.log('DAB_HELPERS_SECURITY_OK');
             with self.assertRaises(SystemExit) as ctx:
                 mod._require_pil_image()
             self.assertIn("Pillow", str(ctx.exception))
+
+            # Saf stdlib magic-byte reddi Pillow kurulu olmadan da çalışır
+            for bad_bytes in (
+                b"%!PS-Adobe-3.0 EPSF-3.0\n",
+                b" \n\x00%!PS-Adobe-3.0\n",
+                b"\xc5\xd0\xd3\xc6\x00\x00\x00\x00",
+                b"%PDF-1.7\n",
+                b"",
+            ):
+                with self.assertRaises(ValueError):
+                    mod.validate_image_magic_bytes(bad_bytes)
+
+            with tempfile.TemporaryDirectory() as td:
+                eps_file = Path(td) / "disguised.jpg"
+                eps_file.write_bytes(b"%!PS-Adobe-3.0 EPSF-3.0\n")
+                with self.assertRaises(ValueError):
+                    mod.open_image_safely(eps_file)
 
 
 class TestMermaidInjectionHardening(unittest.TestCase):
