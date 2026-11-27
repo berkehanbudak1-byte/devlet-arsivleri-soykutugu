@@ -18,11 +18,15 @@ from crop_and_verify import (
     build_lineage_mermaid,
     compute_safe_crop_box,
     extract_zips_if_needed,
+    format_citation_report_markdown,
     hicri_miladi_cevir,
     open_image_safely,
     sanitize_filename,
+    sanitize_markdown_cell,
+    sanitize_mermaid_label,
     trace_migration_timeline,
     validate_safe_path,
+    verify_citations,
 )
 
 
@@ -436,6 +440,335 @@ console.log('DAB_HELPERS_SECURITY_OK');
 """
         proc = subprocess.run(["node", "-e", node_test], capture_output=True, text=True, check=True)
         self.assertIn("DAB_HELPERS_SECURITY_OK", proc.stdout)
+
+
+class TestMermaidInjectionHardening(unittest.TestCase):
+    def test_sanitize_mermaid_label_blocks_xss_quotes_directives_and_unicode_breaks(self):
+        payload = (
+            'Ali"]; click P1 href "javascript:alert(1)" _blank\r\n'
+            "%%{init: {'securityLevel': 'loose'}}%%\u2028"
+            "<img src=x onerror='alert(1)'> #quot; `code` | {x} [y] \\ vbscript:x data:text/html"
+        )
+        cleaned = sanitize_mermaid_label(payload)
+        for forbidden in (
+            "\n",
+            "\r",
+            "\u2028",
+            "\u2029",
+            '"',
+            "'",
+            "<",
+            ">",
+            "`",
+            "|",
+            "[",
+            "]",
+            "{",
+            "}",
+            "\\",
+            "%%",
+            "#",
+            "javascript:",
+            "vbscript:",
+            "data:",
+        ):
+            self.assertNotIn(forbidden, cleaned, f"Forbidden token leaked: {forbidden!r}")
+        self.assertNotRegex(cleaned, r"(?i)\b(?:click|href|classdef|linkstyle|callback)\b")
+        self.assertIn("&lt;img", cleaned)
+        self.assertIn("&quot;", cleaned)
+        self.assertIn("&apos;", cleaned)
+
+    def test_build_lineage_mermaid_injection_hardening(self):
+        res = build_lineage_mermaid([
+            {
+                "hane": '14"];\nclick P1 "javascript:alert(1)"',
+                "isim": 'Halil<script>alert(1)</script> %%{init:{"securityLevel":"loose"}}%%',
+                "baba_adi": "Mustafa'\u2028click A1 href 'https://evil.test' #quot;",
+                "unvan": 'Ağa | `fence` [x]{y}',
+                "yas": 52,
+                "hicri_yil": 1260,
+            }
+        ])
+        mermaid = res["mermaid"]
+        lines = mermaid.splitlines()
+        self.assertEqual(lines[0], "flowchart TD")
+        for line in lines[1:]:
+            self.assertRegex(
+                line,
+                r'^    (?:[PA]\d+\["[^"]*"\]|[PA]\d+ --> P\d+)$',
+                f"Unexpected Mermaid syntax line: {line}",
+            )
+            # Quoted node lines must contain exactly two literal double-quotes
+            if '["' in line:
+                self.assertEqual(line.count('"'), 2, f"Unescaped quote breakout in: {line}")
+
+        self.assertNotIn("%%", mermaid)
+        self.assertNotIn("javascript:", mermaid.lower())
+        self.assertNotIn("<script>", mermaid)
+        self.assertNotRegex(mermaid, r"(?i)\b(?:click|href)\b")
+        self.assertIn("&lt;script&gt;", mermaid)
+        self.assertIn("&quot;", mermaid)
+
+        # Markdown table must also escape raw HTML and pipes
+        md_table_part = res["markdown"].split("```mermaid")[0]
+        self.assertNotIn("<script>", md_table_part)
+        self.assertIn("&lt;script&gt;", md_table_part)
+        for row in [ln for ln in md_table_part.splitlines() if ln.startswith("| ")]:
+            # Header + data rows always have 6 columns -> exactly 7 pipes
+            self.assertEqual(row.count("|"), 7, f"Markdown table column breakout in: {row}")
+
+    def test_trace_migration_timeline_injection_hardening(self):
+        records = [
+            {
+                "hicri_yil": 1260,
+                "kaza": 'Serfice"];\nclick L1 "javascript:alert(1)"',
+                "nahiye": "Velvendos%%{init:{'theme':'dark'}}%%",
+                "karye": "Kozani<img src=x onerror=alert(1)>",
+                "eski_ad": "Kozana `| [evil] #34;",
+                "kisi": "Halil <svg onload=alert(1)>",
+                "olay": 'Temettuat"| L2; click L1 href "https://evil.test" ; L1 -->|"',
+                "fon": "ML.VRD.TMT.d",
+            },
+            {
+                "miladi_yil": 1924,
+                "kaza": "Çatalca",
+                "nahiye": "Merkez",
+                "karye": "İnceğiz",
+                "olay": 'Mübadele\u2029click L2 "javascript:void(0)"',
+                "fon": "BCA 130.16.13.2",
+            },
+        ]
+        res = trace_migration_timeline(records)
+        mermaid = res["mermaid"]
+        lines = mermaid.splitlines()
+        self.assertEqual(lines[0], "flowchart LR")
+        for line in lines[1:]:
+            self.assertRegex(
+                line,
+                r'^    (?:L\d+\["[^"]*"\]|L\d+ -->\|"[^"|]*"\| L\d+)$',
+                f"Unexpected Mermaid migration line: {line}",
+            )
+            self.assertEqual(line.count('"'), 2, f"Unescaped quote breakout in: {line}")
+
+        self.assertNotIn("%%", mermaid)
+        self.assertNotIn("<img", mermaid)
+        self.assertNotIn("<svg", mermaid)
+        self.assertNotIn("javascript:", mermaid.lower())
+        self.assertNotRegex(mermaid, r"(?i)\b(?:click|href)\b")
+        self.assertIn("&lt;img", mermaid)
+
+        # Markdown table & cross-reference bullets must escape HTML/pipes
+        md_before_fence = res["markdown"].split("```mermaid")[0]
+        self.assertNotIn("<img", md_before_fence)
+        self.assertNotIn("<svg", md_before_fence)
+        self.assertIn("&lt;img", md_before_fence)
+        self.assertIn("&lt;svg", md_before_fence)
+
+    def test_sanitize_markdown_cell(self):
+        cleaned = sanitize_markdown_cell("Ali | <script>x</script>\n`tick`")
+        self.assertEqual(cleaned, "Ali / &lt;script&gt;x&lt;/script&gt; 'tick'")
+
+
+class TestVerifyCitations(unittest.TestCase):
+    def test_verify_citations_dataset_compliant_mixed_sources_and_unverified(self):
+        records = [
+            {
+                "hane": 14,
+                "isim": "Halil",
+                "baba_adi": "Mustafa",
+                "fon": "BOA, NFS.d. 1423",
+                "vr": "12a",
+                "poz": "18",
+            },
+            {
+                "isim": "Mehmed",
+                "karye": "İnceğiz",
+                "fon": "BCA 130.16.13.2",
+                "kutu": "4",
+                "dosya": "12",
+                "gomlek": "3",
+            },
+            {
+                "isim": "Ahmet",
+                "edevlet_ref": "e-Devlet Alt-Üst Soy Belgesi (Belge No: 9912)",
+            },
+            {
+                "isim": "Hasan",
+                "kaynak": "NVİGM I\u0307sim Denklik Belgesi",
+            },
+            {
+                "isim": "Hüseyin",
+                "durum": "DOĞRULANMADI",
+                "not": "Ara nüfus defteri henüz incelenmedi",
+            },
+            {
+                "isim": "Veli",
+                "fon": "BOA, NFS.d. 1423",
+                "verified": False,
+                "not": "Aday kayıt; filigran nedeniyle henüz doğrulanmadı",
+            },
+            {
+                "isim": "Kamil",
+                "source": "Fond 42, Box 7, Folder 3",
+            },
+        ]
+        report = verify_citations(records)
+        self.assertTrue(report["compliant"])
+        self.assertEqual(report["input_format"], "dataset")
+        self.assertEqual(report["summary"]["total_claims"], 7)
+        self.assertEqual(report["summary"]["cited"], 5)
+        self.assertEqual(report["summary"]["explicitly_unverified"], 2)
+        self.assertEqual(report["summary"]["uncited"], 0)
+        self.assertEqual(report["summary"]["coverage_ratio"], 1.0)
+        self.assertEqual(report["uncited_claims"], [])
+        self.assertEqual(report["claims"][5]["status"], "EXPLICITLY_UNVERIFIED")
+
+    def test_verify_citations_dataset_rejects_uncited_and_placeholder_hallucinations(self):
+        records = [
+            {"hane": 1, "isim": "Ali", "baba_adi": "Osman", "yas": 40, "hicri_yil": 1260},
+            {"isim": "Bekir", "kaynak": "aile rivayeti"},
+            {"isim": "Cemal", "fon": "bilinmiyor"},
+            {"isim": "Dursun", "source": "tahmin"},
+            {"isim": "Emin", "fon": "ML.VRD.TMT.d. 4521", "vr": "8a"},
+        ]
+        report = verify_citations({"records": records})
+        self.assertFalse(report["compliant"])
+        self.assertEqual(report["summary"]["total_claims"], 5)
+        self.assertEqual(report["summary"]["cited"], 1)
+        self.assertEqual(report["summary"]["uncited"], 4)
+        self.assertEqual(len(report["uncited_claims"]), 4)
+        self.assertEqual([c["index"] for c in report["uncited_claims"]], [1, 2, 3, 4])
+
+    def test_verify_citations_require_locator_flag(self):
+        bare_fond = [{"isim": "Halil", "fon": "NFS.d"}]
+        default_rep = verify_citations(bare_fond)
+        self.assertTrue(default_rep["compliant"])
+        self.assertTrue(len(default_rep["warnings"]) == 1)
+
+        strict_rep = verify_citations(bare_fond, require_locator=True)
+        self.assertFalse(strict_rep["compliant"])
+        self.assertEqual(strict_rep["summary"]["uncited"], 1)
+
+    def test_verify_citations_markdown_compliant_with_footnotes_and_code_blocks(self):
+        md = """# Baba Tarafı Soy Kütüğü Raporu
+
+| Kuşak | İsim | Baba Adı | Doğum | Arşiv Künyesi / Kaynak |
+|-------|------|----------|-------|------------------------|
+| 1 | Halil | Mustafa | ~1792 | BOA, ML.VRD.TMT.d. 4521, vr. 8a, Mi=12 |
+| 2 | Mehmed | Halil | ~1820 | e-Devlet Alt-Üst Soy Belgesi |
+| 3 | Hüseyin | Mehmed | ~1850 | doğrulanmadı |
+
+- **İsmail bin Halil** (1877 mübadili) [^mub]
+- **Osman** (1835 köy muhtarı): BOA, A.{RSK.d. 142, vr. 4b
+
+```mermaid
+flowchart TD
+    P1["Atıf içermeyen diyagram bloğu atlanmalı"]
+```
+
+[^mub]: BCA 130-16-13-2, Kutu 12, Dosya 4, Gömlek 9
+"""
+        report = verify_citations(md)
+        self.assertTrue(report["compliant"], f"Unexpected uncited: {report['uncited_claims']}")
+        self.assertEqual(report["input_format"], "markdown")
+        self.assertEqual(report["summary"]["total_claims"], 5)
+        self.assertEqual(report["summary"]["cited"], 4)
+        self.assertEqual(report["summary"]["explicitly_unverified"], 1)
+        self.assertEqual(report["summary"]["uncited"], 0)
+
+        rendered_md = format_citation_report_markdown(report)
+        self.assertIn("UYUMLU (0 atıfsız iddia)", rendered_md)
+        self.assertIn("`CITED`", rendered_md)
+        self.assertIn("`EXPLICITLY_UNVERIFIED`", rendered_md)
+
+    def test_verify_citations_markdown_rejects_hallucinated_and_uncited_claims(self):
+        md = """# Eksik Atıflı Rapor
+
+| Kuşak | İsim | Kaynak |
+|-------|------|--------|
+| 1 | Halil bin Mustafa | BOA, NFS.d. 1423, vr. 12a |
+| 2 | Uydurma Ata | — |
+
+- **Süleyman bin Ali** [KESİN KANIT] — 1780 yılında Selanik'ten geldi.
+
+Büyük dedemiz Veli bin Hasan 1844 yılında Yakacık köyünde yaşamıştır.
+"""
+        report = verify_citations(md)
+        self.assertFalse(report["compliant"])
+        self.assertEqual(report["summary"]["total_claims"], 4)
+        self.assertEqual(report["summary"]["cited"], 1)
+        self.assertEqual(report["summary"]["uncited"], 3)
+
+    def test_cli_verify_citations_exit_codes_and_formats(self):
+        script = Path(__file__).parent / "crop_and_verify.py"
+
+        # 1) Clean JSON dataset -> exit 0 + valid JSON output
+        clean_payload = json.dumps([
+            {"isim": "Halil", "fon": "BOA, NFS.d. 1423", "vr": "12a", "poz": "18"},
+            {"isim": "Ali", "durum": "doğrulanmadı"},
+        ])
+        proc_ok = subprocess.run(
+            [sys.executable, str(script), "verify-citations", "--records-json", clean_payload],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc_ok.returncode, 0, proc_ok.stderr)
+        parsed_ok = json.loads(proc_ok.stdout)
+        self.assertTrue(parsed_ok["compliant"])
+        self.assertEqual(parsed_ok["summary"]["uncited"], 0)
+
+        # 2) Uncited JSON dataset -> exit 1 + structured JSON output still emitted
+        bad_payload = json.dumps([
+            {"isim": "Halil", "fon": "BOA, NFS.d. 1423", "vr": "12a"},
+            {"isim": "Hayali Dede", "baba_adi": "Bilinmez"},
+        ])
+        proc_bad = subprocess.run(
+            [sys.executable, str(script), "verify-citations", "--records-json", bad_payload],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(proc_bad.returncode, 1)
+        parsed_bad = json.loads(proc_bad.stdout)
+        self.assertFalse(parsed_bad["compliant"])
+        self.assertEqual(parsed_bad["summary"]["uncited"], 1)
+
+        # 3) Markdown file input with --format markdown -> exit 0 on clean, exit 1 on uncited
+        with tempfile.TemporaryDirectory() as td:
+            clean_md = Path(td) / "clean.md"
+            clean_md.write_text(
+                "- **Halil bin Mustafa** (1844): BOA, ML.VRD.TMT.d. 4521, vr. 8a\n"
+                "- **Veli bin Halil** (~1815): doğrulanmadı\n",
+                encoding="utf-8",
+            )
+            proc_md_ok = subprocess.run(
+                [sys.executable, str(script), "verify-citations", "--input", str(clean_md), "--format", "markdown"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc_md_ok.returncode, 0, proc_md_ok.stderr)
+            self.assertIn("UYUMLU", proc_md_ok.stdout)
+
+            bad_md = Path(td) / "bad.md"
+            bad_md.write_text(
+                "- **Halil bin Mustafa** 1844 yılında köyde doğdu.\n",
+                encoding="utf-8",
+            )
+            proc_md_bad = subprocess.run(
+                [sys.executable, str(script), "verify-citations", "--markdown", str(bad_md), "--format", "markdown"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(proc_md_bad.returncode, 1)
+            self.assertIn("UYUMSUZ", proc_md_bad.stdout)
+            self.assertIn("`UNCITED`", proc_md_bad.stdout)
+
+            # 4) Path traversal blocked
+            proc_trav = subprocess.run(
+                [sys.executable, str(script), "verify-citations", "--input", str(Path(td) / ".." / "escape.md")],
+                capture_output=True,
+                text=True,
+            )
+            self.assertNotEqual(proc_trav.returncode, 0)
 
 
 if __name__ == "__main__":
