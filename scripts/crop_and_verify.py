@@ -14,6 +14,8 @@ uzantılı Osmanlıca defter görüntülerini:
 Gereksinim: Python 3.8+ ve Pillow (`pip install Pillow`)
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -22,15 +24,10 @@ import re
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
-
-try:
-    from PIL import Image
-except ImportError:
-    sys.exit("Hata: 'Pillow' kütüphanesi kurulu değil. Kurmak için: pip install Pillow")
+from typing import Any
 
 # Güvenlik sınırları (decompression bomb / zip bomb / çıktı boyut koruması)
 MAX_IMAGE_PIXELS = 100_000_000  # 100 MP üst sınır
-Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 MAX_ZIP_FILES = 2000
 MAX_ZIP_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB toplam açılmış boyut sınırı
@@ -89,12 +86,23 @@ def validate_safe_path(
     return resolved
 
 
-def open_image_safely(img_path: Path) -> Image.Image:
-    """Görüntüyü decompression bomb koruması (Image.MAX_IMAGE_PIXELS) etkin biçimde açar."""
-    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+def _require_pil_image() -> Any:
+    """Pillow (PIL.Image) modülünü yalnızca görüntü komutlarında tembel (lazy) yükler."""
     try:
-        im = Image.open(img_path)
-    except Image.DecompressionBombError as exc:
+        from PIL import Image as pil_image
+    except ImportError:
+        sys.exit("Hata: 'Pillow' kütüphanesi kurulu değil. Kurmak için: pip install Pillow")
+    pil_image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    return pil_image
+
+
+def open_image_safely(img_path: Path) -> Any:
+    """Görüntüyü decompression bomb koruması (Image.MAX_IMAGE_PIXELS) etkin biçimde açar."""
+    pil_image = _require_pil_image()
+    pil_image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    try:
+        im = pil_image.open(img_path)
+    except pil_image.DecompressionBombError as exc:
         raise ValueError(
             f"Görüntü piksel üst sınırını ({MAX_IMAGE_PIXELS} px) aşıyor (decompression bomb koruması): {exc}"
         ) from exc
@@ -358,7 +366,8 @@ def cmd_crop(args: argparse.Namespace) -> None:
 
             crop = im.crop((x1, y1, x2, y2))
             if zoom_val != 1.0:
-                resample = Image.Resampling.NEAREST if args.nearest else Image.Resampling.LANCZOS
+                pil_image = _require_pil_image()
+                resample = pil_image.Resampling.NEAREST if args.nearest else pil_image.Resampling.LANCZOS
                 crop = crop.resize((out_w, out_h), resample)
 
             crop.save(out_path)
@@ -587,6 +596,24 @@ def cmd_query_builder(args: argparse.Namespace) -> None:
         print(f"    [{idx:02d}] {q}")
 
 
+def _escape_mermaid_label(text: object, *, escape_pipe: bool = False) -> str:
+    """Mermaid etiketlerini yeni satır, tırnak ve köşeli/açılı parantez enjeksiyonundan arındırır."""
+    s = str(text or "")
+    s = s.replace("\r", " ").replace("\n", " ").replace("\u2028", " ").replace("\u2029", " ")
+    s = _CONTROL_CHAR_RE.sub(" ", s)
+    s = (
+        s.replace('"', "'")
+        .replace("`", "'")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("[", "&#91;")
+        .replace("]", "&#93;")
+    )
+    if escape_pipe:
+        s = s.replace("|", "/")
+    return re.sub(r"\s+", " ", s).strip()
+
+
 def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]:
     """
     Osmanlı Nüfus / Temettuat defteri hane kayıtlarını (`hane`, `isim`, `baba_adi`, `yas`, `hicri_yil`)
@@ -651,15 +678,11 @@ def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]
     ancestor_nodes: dict[tuple[str, str], str] = {}
     anc_counter = 0
 
-    def _safe_mermaid_text(text: object) -> str:
-        s = _CONTROL_CHAR_RE.sub(" ", str(text or ""))
-        return s.replace('"', "'").replace("`", "'").replace("<", "&lt;").replace(">", "&gt;").strip()
-
     for item in enriched:
         nid = str(item["node_id"])
-        hane = _safe_mermaid_text(item["hane"])
-        isim = _safe_mermaid_text(item["isim"])
-        unvan = _safe_mermaid_text(item["unvan"])
+        hane = _escape_mermaid_label(item["hane"])
+        isim = _escape_mermaid_label(item["isim"])
+        unvan = _escape_mermaid_label(item["unvan"])
         label_parts = [f"Hane {hane}: {isim}"]
         if unvan:
             label_parts[0] += f" ({unvan})"
@@ -687,14 +710,18 @@ def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]
                 anc_counter += 1
                 parent_id = f"A{anc_counter}"
                 ancestor_nodes[anc_key] = parent_id
-                safe_baba = _safe_mermaid_text(baba)
-                safe_hane = _safe_mermaid_text(hane)
+                safe_baba = _escape_mermaid_label(baba)
+                safe_hane = _escape_mermaid_label(hane)
                 lines.append(f'    {parent_id}["Hane {safe_hane}: {safe_baba} (Ata / Baba)"]')
             else:
                 parent_id = ancestor_nodes[anc_key]
         lines.append(f"    {parent_id} --> {nid}")
 
     mermaid_str = "\n".join(lines)
+
+    def _safe_md_cell(val: object) -> str:
+        s = re.sub(r"[\r\n\u2028\u2029]+", " ", str(val or ""))
+        return _CONTROL_CHAR_RE.sub(" ", s).replace("|", "/").strip()
 
     md_lines = [
         "### Osmanlı Arşiv Hane Soy Ağacı (Pedigree & Miladî Doğum Tablosu)",
@@ -715,7 +742,7 @@ def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]
             else "—"
         )
         md_lines.append(
-            f"| {item['hane']} | {item['isim']} | {item['baba_adi'] or '—'} | {yas_str} | {yil_str} | {dogum_str} |"
+            f"| {_safe_md_cell(item['hane'])} | {_safe_md_cell(item['isim'])} | {_safe_md_cell(item['baba_adi']) or '—'} | {yas_str} | {yil_str} | {dogum_str} |"
         )
     md_lines.extend(["", "```mermaid", mermaid_str, "```"])
     markdown_str = "\n".join(md_lines)
@@ -974,10 +1001,6 @@ def trace_migration_timeline(records: list[dict[str, object]]) -> dict[str, obje
                 "variants": loc["karye_variants"],
             })
 
-    def _safe(text: object) -> str:
-        s = _CONTROL_CHAR_RE.sub(" ", str(text or ""))
-        return s.replace('"', "'").replace("|", "/").replace("`", "'").replace("<", "&lt;").replace(">", "&gt;").strip()
-
     lines: list[str] = ["flowchart LR"]
     for loc in unique_locations:
         parts = [x for x in [str(loc["kaza"]), str(loc["nahiye"]), str(loc["karye"])] if x]
@@ -987,13 +1010,13 @@ def trace_migration_timeline(records: list[dict[str, object]]) -> dict[str, obje
         if loc["years"]:
             yrs = ", ".join(str(y) for y in loc["years"])
             title += f" [{yrs}]"
-        lines.append(f'    {loc["loc_id"]}["{_safe(title)}"]')
+        lines.append(f'    {loc["loc_id"]}["{_escape_mermaid_label(title, escape_pipe=True)}"]')
 
     for tr in transitions:
         ekey = (str(tr["from_loc_id"]), str(tr["to_loc_id"]), str(tr["edge_text"]))
         if ekey not in seen_edges:
             seen_edges.add(ekey)
-            lines.append(f'    {tr["from_loc_id"]} -->|"{_safe(tr["edge_text"])}"| {tr["to_loc_id"]}')
+            lines.append(f'    {tr["from_loc_id"]} -->|"{_escape_mermaid_label(tr["edge_text"], escape_pipe=True)}"| {tr["to_loc_id"]}')
 
     mermaid_str = "\n".join(lines)
 
