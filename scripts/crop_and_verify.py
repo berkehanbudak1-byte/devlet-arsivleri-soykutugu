@@ -14,6 +14,8 @@ uzantılı Osmanlıca defter görüntülerini:
 Gereksinim: Python 3.8+ ve Pillow (`pip install Pillow`)
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -22,15 +24,10 @@ import re
 import sys
 import zipfile
 from pathlib import Path, PurePosixPath
-
-try:
-    from PIL import Image
-except ImportError:
-    sys.exit("Hata: 'Pillow' kütüphanesi kurulu değil. Kurmak için: pip install Pillow")
+from typing import Any
 
 # Güvenlik sınırları (decompression bomb / zip bomb / çıktı boyut koruması)
 MAX_IMAGE_PIXELS = 100_000_000  # 100 MP üst sınır
-Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
 
 MAX_ZIP_FILES = 2000
 MAX_ZIP_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB toplam açılmış boyut sınırı
@@ -74,8 +71,6 @@ def sanitize_mermaid_label(text: object) -> str:
         s.replace("\\", "/")
         .replace(";", ",")
         .replace("|", "/")
-        .replace("[", "(")
-        .replace("]", ")")
         .replace("{", "(")
         .replace("}", ")")
         .replace("`", " ")
@@ -84,13 +79,16 @@ def sanitize_mermaid_label(text: object) -> str:
     # Tehlikeli URI şemalarını ve etkileşimli Mermaid anahtar kelimelerini etkisizleştir
     s = _DANGEROUS_URI_SCHEME_RE.sub("", s)
     s = _MERMAID_DIRECTIVE_TOKEN_RE.sub("", s)
-    # HTML ve tırnak kaçışları (& her zaman ilk sırada)
+    # HTML, tırnak ve köşeli parantez kaçışları (& her zaman ilk sırada;
+    # [ ve ] Mermaid düğüm sözdizimini kırmamak için &#91;/&#93; olarak kaçışlanır)
     s = (
         s.replace("&", "&amp;")
         .replace("<", "&lt;")
         .replace(">", "&gt;")
         .replace('"', "&quot;")
         .replace("'", "&apos;")
+        .replace("[", "&#91;")
+        .replace("]", "&#93;")
     )
     return re.sub(r"\s+", " ", s).strip()
 
@@ -149,12 +147,23 @@ def validate_safe_path(
     return resolved
 
 
-def open_image_safely(img_path: Path) -> Image.Image:
-    """Görüntüyü decompression bomb koruması (Image.MAX_IMAGE_PIXELS) etkin biçimde açar."""
-    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+def _require_pil_image() -> Any:
+    """Pillow (PIL.Image) modülünü yalnızca görüntü komutlarında tembel (lazy) yükler."""
     try:
-        im = Image.open(img_path)
-    except Image.DecompressionBombError as exc:
+        from PIL import Image as pil_image
+    except ImportError:
+        sys.exit("Hata: 'Pillow' kütüphanesi kurulu değil. Kurmak için: pip install Pillow")
+    pil_image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    return pil_image
+
+
+def open_image_safely(img_path: Path) -> Any:
+    """Görüntüyü decompression bomb koruması (Image.MAX_IMAGE_PIXELS) etkin biçimde açar."""
+    pil_image = _require_pil_image()
+    pil_image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    try:
+        im = pil_image.open(img_path)
+    except pil_image.DecompressionBombError as exc:
         raise ValueError(
             f"Görüntü piksel üst sınırını ({MAX_IMAGE_PIXELS} px) aşıyor (decompression bomb koruması): {exc}"
         ) from exc
@@ -418,7 +427,8 @@ def cmd_crop(args: argparse.Namespace) -> None:
 
             crop = im.crop((x1, y1, x2, y2))
             if zoom_val != 1.0:
-                resample = Image.Resampling.NEAREST if args.nearest else Image.Resampling.LANCZOS
+                pil_image = _require_pil_image()
+                resample = pil_image.Resampling.NEAREST if args.nearest else pil_image.Resampling.LANCZOS
                 crop = crop.resize((out_w, out_h), resample)
 
             crop.save(out_path)
@@ -645,6 +655,12 @@ def cmd_query_builder(args: argparse.Namespace) -> None:
     print("  Önerilen Katalog Arama Sorguları:")
     for idx, q in enumerate(plan["queries"], 1):
         print(f"    [{idx:02d}] {q}")
+
+
+def _escape_mermaid_label(text: object, *, escape_pipe: bool = False) -> str:
+    """Geriye dönük uyumluluk sarmalayıcısı; tüm Mermaid kaçışlarını `sanitize_mermaid_label` üzerinden yürütür."""
+    _ = escape_pipe  # sanitize_mermaid_label dikey çubuğu (|) her zaman güvenli biçimde kaçışlar
+    return sanitize_mermaid_label(text)
 
 
 def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]:

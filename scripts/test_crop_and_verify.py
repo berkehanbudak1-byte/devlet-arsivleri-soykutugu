@@ -1,5 +1,9 @@
+import contextlib
+import importlib.util
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -10,10 +14,16 @@ from unittest.mock import patch
 
 from PIL import Image
 
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
 from crop_and_verify import (
     MAX_CROP_ZOOM,
     MAX_IMAGE_PIXELS,
     MAX_OUTPUT_DIMENSION,
+    _escape_mermaid_label,
+    _require_pil_image,
     build_archive_queries,
     build_lineage_mermaid,
     compute_safe_crop_box,
@@ -215,11 +225,12 @@ class TestCropAndVerifyCalendar(unittest.TestCase):
 
 class TestCropAndVerifySecurity(unittest.TestCase):
     def test_decompression_bomb_limit_configured_and_enforced(self):
-        self.assertEqual(Image.MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS)
+        pil_image = _require_pil_image()
+        self.assertEqual(pil_image.MAX_IMAGE_PIXELS, MAX_IMAGE_PIXELS)
         self.assertGreater(MAX_IMAGE_PIXELS, 0)
         self.assertLessEqual(MAX_IMAGE_PIXELS, 100_000_000)
 
-        with patch("crop_and_verify.Image.open", side_effect=Image.DecompressionBombError("bomb")):
+        with patch("PIL.Image.open", side_effect=Image.DecompressionBombError("bomb")):
             with self.assertRaises(ValueError) as ctx:
                 open_image_safely(Path("dummy.png"))
         self.assertIn("decompression bomb", str(ctx.exception).lower())
@@ -234,7 +245,7 @@ class TestCropAndVerifySecurity(unittest.TestCase):
                 self.closed = True
 
         stub = _OversizedStub()
-        with patch("crop_and_verify.Image.open", return_value=stub):
+        with patch("PIL.Image.open", return_value=stub):
             with self.assertRaises(ValueError) as ctx2:
                 open_image_safely(Path("oversized.png"))
         self.assertTrue(stub.closed)
@@ -441,6 +452,122 @@ console.log('DAB_HELPERS_SECURITY_OK');
         proc = subprocess.run(["node", "-e", node_test], capture_output=True, text=True, check=True)
         self.assertIn("DAB_HELPERS_SECURITY_OK", proc.stdout)
 
+    def test_build_lineage_mermaid_escapes_newlines_quotes_and_brackets(self):
+        records = [
+            {
+                "hane": "1]\nX[2",
+                "isim": 'Ali "Kara"\r\n[şüpheli] <tag>',
+                "baba_adi": 'Mustafa [ata]\n"eski" <baba>',
+                "unvan": "Ağa [1]\rReis",
+                "yas": 42,
+                "hicri_yil": 1293,
+            }
+        ]
+        res = build_lineage_mermaid(records)
+        mermaid_lines = res["mermaid"].splitlines()
+        self.assertEqual(mermaid_lines[0], "flowchart TD")
+
+        node_re = re.compile(r'^\s+(?:P\d+|A\d+)\["[^"\[\]<>\r\n]+"\]$')
+        edge_re = re.compile(r"^\s+(?:P\d+|A\d+) --> P\d+$")
+        node_lines = []
+        for line in mermaid_lines[1:]:
+            self.assertTrue(
+                node_re.match(line) or edge_re.match(line),
+                f"Mermaid sözdizimi bozuldu: {line!r}",
+            )
+            if node_re.match(line):
+                node_lines.append(line)
+
+        self.assertEqual(len(node_lines), 2)
+        joined_nodes = "\n".join(node_lines)
+        self.assertIn("&#91;şüpheli&#93;", joined_nodes)
+        self.assertIn("&#91;ata&#93;", joined_nodes)
+        self.assertIn("&lt;tag&gt;", joined_nodes)
+        self.assertIn("&lt;baba&gt;", joined_nodes)
+        self.assertNotIn("\r", res["mermaid"])
+
+        # Markdown tablo satırları da yeni satırla bölünmemeli
+        table_rows = [ln for ln in res["markdown"].splitlines() if ln.startswith("| ")]
+        self.assertEqual(len(table_rows), 2)
+
+        # migration-map diyagramında da köşeli parantez ve yeni satırlar kaçışlanmalı
+        mig = trace_migration_timeline([
+            {
+                "hicri_yil": 1260,
+                "kaza": 'Serfice "A"\n[1]',
+                "karye": "Kozani <eski>",
+                "olay": "Nakil\r\n[test]",
+            },
+            {
+                "miladi_yil": 1880,
+                "kaza": "Manastır",
+                "karye": "İnceğiz",
+                "olay": 'Göç "2" [yeni]',
+            },
+        ])
+        for line in mig["mermaid"].splitlines()[1:]:
+            self.assertNotIn("\r", line)
+            self.assertNotIn("<eski>", line)
+        self.assertIn("&#91;1&#93;", mig["mermaid"])
+        self.assertIn("&#91;yeni&#93;", mig["mermaid"])
+
+    def test_lazy_pil_import_text_only_subcommands_work_without_pil(self):
+        script_path = Path(__file__).resolve().parent / "crop_and_verify.py"
+        blocked = {"PIL": None, "PIL.Image": None}
+
+        with patch.dict(sys.modules, blocked):
+            spec = importlib.util.spec_from_file_location("crop_and_verify_no_pil", script_path)
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+
+            cases = [
+                (["crop_and_verify.py", "calendar", "--year", "1293", "--birth-age", "35"], "1876"),
+                (
+                    ["crop_and_verify.py", "query-builder", "--name", "Mehmedoğlu", "--place", "Muğla", "--year", "1293"],
+                    "Mehmedzade",
+                ),
+                (
+                    [
+                        "crop_and_verify.py",
+                        "lineage-tree",
+                        "--records-json",
+                        json.dumps([{"hane": 1, "isim": "Halil", "baba_adi": "Mustafa", "yas": 40, "hicri_yil": 1260}]),
+                    ],
+                    "flowchart TD",
+                ),
+                (
+                    [
+                        "crop_and_verify.py",
+                        "migration-map",
+                        "--records-json",
+                        json.dumps([{"hicri_yil": 1260, "kaza": "Üsküdar", "karye": "Yakacık"}]),
+                    ],
+                    "flowchart LR",
+                ),
+                (
+                    [
+                        "crop_and_verify.py",
+                        "verify-citations",
+                        "--records-json",
+                        json.dumps([{"isim": "Halil", "fon": "BOA, NFS.d. 1423", "vr": "12a"}]),
+                    ],
+                    '"compliant": true',
+                ),
+            ]
+
+            for argv, expected in cases:
+                buf = io.StringIO()
+                with patch.object(sys, "argv", argv), contextlib.redirect_stdout(buf):
+                    mod.main()
+                self.assertIn(expected, buf.getvalue())
+
+            # Görüntü komutu / yardımcısı Pillow olmadığında temiz hata mesajıyla çıkar
+            with self.assertRaises(SystemExit) as ctx:
+                mod._require_pil_image()
+            self.assertIn("Pillow", str(ctx.exception))
+
 
 class TestMermaidInjectionHardening(unittest.TestCase):
     def test_sanitize_mermaid_label_blocks_xss_quotes_directives_and_unicode_breaks(self):
@@ -450,6 +577,7 @@ class TestMermaidInjectionHardening(unittest.TestCase):
             "<img src=x onerror='alert(1)'> #quot; `code` | {x} [y] \\ vbscript:x data:text/html"
         )
         cleaned = sanitize_mermaid_label(payload)
+        self.assertEqual(_escape_mermaid_label(payload, escape_pipe=True), cleaned)
         for forbidden in (
             "\n",
             "\r",
@@ -467,16 +595,18 @@ class TestMermaidInjectionHardening(unittest.TestCase):
             "}",
             "\\",
             "%%",
-            "#",
+            "#quot;",
             "javascript:",
             "vbscript:",
             "data:",
         ):
             self.assertNotIn(forbidden, cleaned, f"Forbidden token leaked: {forbidden!r}")
+        self.assertNotRegex(cleaned, r"(?<!&)#|&#(?!91;|93;)")
         self.assertNotRegex(cleaned, r"(?i)\b(?:click|href|classdef|linkstyle|callback)\b")
         self.assertIn("&lt;img", cleaned)
         self.assertIn("&quot;", cleaned)
         self.assertIn("&apos;", cleaned)
+        self.assertIn("&#91;y&#93;", cleaned)
 
     def test_build_lineage_mermaid_injection_hardening(self):
         res = build_lineage_mermaid([
