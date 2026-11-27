@@ -26,13 +26,22 @@ jobs:
         with:
           node-version: '22'
 
-      - name: Install minimal dependencies
-        run: python3 -m pip install --no-cache-dir pillow
-
       - name: Syntax checks
         run: |
           python3 -m py_compile scripts/crop_and_verify.py scripts/test_crop_and_verify.py
           node --check scripts/dab_helpers.js
 
+      - name: Test text-only CLI subcommands without Pillow
+        run: |
+          python3 -m venv --without-pip "$RUNNER_TEMP/no-pil-venv"
+          "$RUNNER_TEMP/no-pil-venv/bin/python" -c "import importlib.util; assert importlib.util.find_spec('PIL') is None"
+          "$RUNNER_TEMP/no-pil-venv/bin/python" scripts/crop_and_verify.py calendar --year 1293 --birth-age 35
+          "$RUNNER_TEMP/no-pil-venv/bin/python" scripts/crop_and_verify.py query-builder --name "Mehmedoğlu" --place "Muğla" --year 1293
+          "$RUNNER_TEMP/no-pil-venv/bin/python" scripts/crop_and_verify.py lineage-tree --records-json '[{"hane":1,"isim":"Halil","baba_adi":"Mustafa","yas":40,"hicri_yil":1260}]'
+          "$RUNNER_TEMP/no-pil-venv/bin/python" scripts/crop_and_verify.py migration-map --records-json '[{"hicri_yil":1260,"kaza":"Üsküdar","karye":"Yakacık"}]'
+
+      - name: Install dependencies
+        run: python3 -m pip install --no-cache-dir -r requirements.txt
+
       - name: Run unit tests
-        run: PYTHONPATH=scripts python3 -m unittest discover -s scripts -p "test_*.py" -v
+        run: python3 -m unittest discover -v
