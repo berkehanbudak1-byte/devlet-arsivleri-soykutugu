@@ -16,41 +16,249 @@ Gereksinim: Python 3.8+ ve Pillow (`pip install Pillow`)
 
 import argparse
 import json
+import math
 import os
+import re
 import sys
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 try:
     from PIL import Image
 except ImportError:
     sys.exit("Hata: 'Pillow' kütüphanesi kurulu değil. Kurmak için: pip install Pillow")
 
+# Güvenlik sınırları (decompression bomb / zip bomb / çıktı boyut koruması)
+MAX_IMAGE_PIXELS = 100_000_000  # 100 MP üst sınır
+Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+
+MAX_ZIP_FILES = 2000
+MAX_ZIP_TOTAL_BYTES = 500 * 1024 * 1024  # 500 MB toplam açılmış boyut sınırı
+MAX_ZIP_FILE_BYTES = 100 * 1024 * 1024   # 100 MB tekil dosya sınırı
+MAX_ZIP_COMPRESSION_RATIO = 100.0
+MAX_JSON_BYTES = 5 * 1024 * 1024         # 5 MB JSON girdi sınırı
+
+MIN_CROP_ZOOM = 0.1
+MAX_CROP_ZOOM = 8.0
+MAX_OUTPUT_DIMENSION = 12000
+MAX_OUTPUT_PIXELS = 64_000_000
+
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+_CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]+')
+
+
+def sanitize_filename(name: str, fallback: str = "output", max_length: int = 120) -> str:
+    """Dosya adından yol ayırıcı, kontrol karakteri ve geçiş (..) dizilerini temizler."""
+    raw = str(name or "").strip()
+    raw = _UNSAFE_FILENAME_RE.sub("_", raw)
+    raw = raw.replace("..", "_")
+    raw = re.sub(r"\s+", "_", raw).strip("._ ")
+    if not raw:
+        return fallback
+    return raw[:max_length]
+
+
+def validate_safe_path(
+    raw_path: str | Path,
+    base_dir: Path | None = None,
+    *,
+    allow_symlinks: bool = False,
+) -> Path:
+    """
+    Yol enjeksiyonu (NUL/kontrol karakterleri, '..' traversal segmentleri ve
+    isteğe bağlı taban klasör dışına çıkış) kontrollerini uygular.
+    """
+    path_str = str(raw_path or "")
+    if not path_str.strip():
+        raise ValueError("Dosya/klasör yolu boş olamaz.")
+    if _CONTROL_CHAR_RE.search(path_str):
+        raise ValueError("Dosya/klasör yolunda geçersiz kontrol karakteri tespit edildi.")
+
+    p = Path(path_str)
+    if ".." in p.parts:
+        raise ValueError(f"Güvensiz yol geçişi ('..') reddedildi: {path_str}")
+    if not allow_symlinks and p.is_symlink():
+        raise ValueError(f"Sembolik bağlantı (symlink) yolu reddedildi: {path_str}")
+
+    resolved = p.resolve()
+    if base_dir is not None:
+        base_resolved = base_dir.resolve()
+        if not resolved.is_relative_to(base_resolved):
+            raise ValueError(f"Hedef yol izin verilen dizin dışında: {path_str}")
+    return resolved
+
+
+def open_image_safely(img_path: Path) -> Image.Image:
+    """Görüntüyü decompression bomb koruması (Image.MAX_IMAGE_PIXELS) etkin biçimde açar."""
+    Image.MAX_IMAGE_PIXELS = MAX_IMAGE_PIXELS
+    try:
+        im = Image.open(img_path)
+    except Image.DecompressionBombError as exc:
+        raise ValueError(
+            f"Görüntü piksel üst sınırını ({MAX_IMAGE_PIXELS} px) aşıyor (decompression bomb koruması): {exc}"
+        ) from exc
+    if im.width * im.height > MAX_IMAGE_PIXELS:
+        pixels = im.width * im.height
+        im.close()
+        raise ValueError(
+            f"Görüntü piksel üst sınırını ({pixels} > {MAX_IMAGE_PIXELS} px) aşıyor (decompression bomb koruması)."
+        )
+    return im
+
+
+def compute_safe_crop_box(
+    width: int,
+    height: int,
+    box_str: str,
+    zoom: float = 1.0,
+) -> tuple[int, int, int, int, int, int]:
+    """
+    Kesit koordinatlarını ve büyütme katsayısını doğrular; çıktı piksel ve kenar
+    boyutlarını güvenli üst sınırlar içinde tutar.
+    Dönüş: (x1, y1, x2, y2, out_w, out_h)
+    """
+    if width <= 0 or height <= 0:
+        raise ValueError("Kaynak görüntü boyutları pozitif olmalıdır.")
+    if not isinstance(zoom, (int, float)) or not math.isfinite(zoom):
+        raise ValueError("--zoom parametresi geçerli bir sayı olmalıdır.")
+    if zoom < MIN_CROP_ZOOM or zoom > MAX_CROP_ZOOM:
+        raise ValueError(
+            f"--zoom parametresi {MIN_CROP_ZOOM} ile {MAX_CROP_ZOOM} arasında olmalıdır."
+        )
+
+    try:
+        vals = [float(v.strip()) for v in str(box_str).split(",")]
+    except ValueError as exc:
+        raise ValueError("--box parametresi sayısal değerlerden oluşmalıdır ('x1,y1,x2,y2').") from exc
+    if len(vals) != 4 or not all(math.isfinite(v) for v in vals):
+        raise ValueError(
+            "--box parametresi 'x1,y1,x2,y2' formatında 4 sonlu sayı olmalıdır (0.0-1.0 oran veya piksel)."
+        )
+    if any(v < 0 for v in vals):
+        raise ValueError("--box koordinatları negatif olamaz.")
+
+    if all(0.0 <= v <= 1.0 for v in vals):
+        x1, y1, x2, y2 = int(vals[0] * width), int(vals[1] * height), int(vals[2] * width), int(vals[3] * height)
+    else:
+        x1, y1, x2, y2 = [int(v) for v in vals]
+
+    x1, x2 = max(0, min(width, x1)), max(0, min(width, x2))
+    y1, y2 = max(0, min(height, y1)), max(0, min(height, y2))
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"Geçersiz kesit koordinatları ({x1},{y1},{x2},{y2}); x2 > x1 ve y2 > y1 olmalıdır.")
+
+    crop_w = x2 - x1
+    crop_h = y2 - y1
+    out_w = max(1, int(round(crop_w * zoom))) if zoom != 1.0 else crop_w
+    out_h = max(1, int(round(crop_h * zoom))) if zoom != 1.0 else crop_h
+
+    if out_w > MAX_OUTPUT_DIMENSION or out_h > MAX_OUTPUT_DIMENSION:
+        raise ValueError(
+            f"Kesit çıktı boyutu ({out_w}x{out_h}) izin verilen tek kenar sınırını ({MAX_OUTPUT_DIMENSION} px) aşıyor."
+        )
+    if out_w * out_h > MAX_OUTPUT_PIXELS:
+        raise ValueError(
+            f"Kesit toplam piksel sayısı ({out_w * out_h}) izin verilen sınırı ({MAX_OUTPUT_PIXELS} px) aşıyor."
+        )
+    return x1, y1, x2, y2, out_w, out_h
+
+
+def _is_zip_symlink(member: zipfile.ZipInfo) -> bool:
+    """ZIP üyesinin Unix sembolik bağlantısı olup olmadığını kontrol eder."""
+    unix_mode = (member.external_attr >> 16) & 0o170000
+    return unix_mode == 0o120000
 
 
 def extract_zips_if_needed(input_dir: Path, extract_root: Path) -> list[Path]:
     """Klasördeki .zip arşivlerini güvenli biçimde açar ve tüm görüntü yollarını döndürür."""
+    input_resolved = validate_safe_path(input_dir)
+    extract_root_resolved = validate_safe_path(extract_root)
+
     images: list[Path] = []
-    for root, _, files in os.walk(input_dir):
+    for root, _, files in os.walk(input_resolved, followlinks=False):
         for fn in sorted(files):
             fpath = Path(root) / fn
+            if fpath.is_symlink():
+                continue
             ext = fpath.suffix.lower()
             if ext == ".zip":
-                target = extract_root / fpath.stem
+                safe_stem = sanitize_filename(fpath.stem, fallback="archive")
+                target = validate_safe_path(extract_root_resolved / safe_stem, base_dir=extract_root_resolved)
                 if not target.exists():
                     target.mkdir(parents=True, exist_ok=True)
                     with zipfile.ZipFile(fpath, "r") as zf:
+                        infos = zf.infolist()
+                        if len(infos) > MAX_ZIP_FILES:
+                            raise ValueError(
+                                f"ZIP arşivi izin verilen dosya sayısını ({MAX_ZIP_FILES}) aşıyor: {fpath.name}"
+                            )
+                        total_uncompressed = 0
+                        actual_total_written = 0
                         target_resolved = target.resolve()
-                        for member in zf.infolist():
-                            # Zip-slip güvenlik kontrolü
-                            dest = (target / member.filename).resolve()
+                        for member in infos:
+                            raw_member_name = member.filename
+                            if _CONTROL_CHAR_RE.search(raw_member_name):
+                                raise ValueError(f"Güvensiz zip üyesi adı reddedildi: {raw_member_name!r}")
+                            if _is_zip_symlink(member):
+                                raise ValueError(f"ZIP içindeki sembolik bağlantı reddedildi: {raw_member_name}")
+                            normalized_posix = raw_member_name.replace("\\", "/")
+                            posix_parts = PurePosixPath(normalized_posix).parts
+                            if (
+                                normalized_posix.startswith("/")
+                                or ".." in posix_parts
+                                or (len(normalized_posix) >= 2 and normalized_posix[1] == ":")
+                            ):
+                                raise ValueError(f"Güvensiz zip yolu reddedildi: {raw_member_name}")
+
+                            dest = (target_resolved / normalized_posix).resolve()
                             if not dest.is_relative_to(target_resolved):
-                                raise ValueError(f"Güvensiz zip yolu reddedildi: {member.filename}")
-                            zf.extract(member, target)
-                for zroot, _, zfiles in os.walk(target):
+                                raise ValueError(f"Güvensiz zip yolu reddedildi: {raw_member_name}")
+
+                            if member.file_size > MAX_ZIP_FILE_BYTES:
+                                raise ValueError(
+                                    f"ZIP üyesi boyut sınırını ({MAX_ZIP_FILE_BYTES} B) aşıyor: {raw_member_name}"
+                                )
+                            total_uncompressed += member.file_size
+                            if total_uncompressed > MAX_ZIP_TOTAL_BYTES:
+                                raise ValueError(
+                                    f"ZIP toplam açılmış boyut sınırını ({MAX_ZIP_TOTAL_BYTES} B) aşıyor: {fpath.name}"
+                                )
+                            if member.compress_size > 0 and (member.file_size / member.compress_size) > MAX_ZIP_COMPRESSION_RATIO:
+                                raise ValueError(
+                                    f"Şüpheli sıkıştırma oranı (zip bomb koruması) reddedildi: {raw_member_name}"
+                                )
+
+                            if member.is_dir():
+                                dest.mkdir(parents=True, exist_ok=True)
+                            else:
+                                dest.parent.mkdir(parents=True, exist_ok=True)
+                                try:
+                                    with zf.open(member, "r") as src_fh, open(dest, "wb") as dst_fh:
+                                        written = 0
+                                        while True:
+                                            chunk = src_fh.read(65536)
+                                            if not chunk:
+                                                break
+                                            written += len(chunk)
+                                            actual_total_written += len(chunk)
+                                            if written > MAX_ZIP_FILE_BYTES:
+                                                raise ValueError(
+                                                    f"ZIP üyesi gerçek boyut sınırını aşıyor: {raw_member_name}"
+                                                )
+                                            if actual_total_written > MAX_ZIP_TOTAL_BYTES:
+                                                raise ValueError(
+                                                    f"ZIP toplam gerçek açılmış boyut sınırını ({MAX_ZIP_TOTAL_BYTES} B) aşıyor: {fpath.name}"
+                                                )
+                                            dst_fh.write(chunk)
+                                except Exception:
+                                    dest.unlink(missing_ok=True)
+                                    raise
+                for zroot, _, zfiles in os.walk(target, followlinks=False):
                     for zfn in sorted(zfiles):
                         zp = Path(zroot) / zfn
+                        if zp.is_symlink():
+                            continue
                         if zp.suffix.lower() in IMAGE_EXTS:
                             images.append(zp)
             elif ext in IMAGE_EXTS:
@@ -68,88 +276,95 @@ def extract_zips_if_needed(input_dir: Path, extract_root: Path) -> list[Path]:
 
 
 def cmd_inventory(args: argparse.Namespace) -> None:
-    in_dir = Path(args.input)
+    try:
+        in_dir = validate_safe_path(args.input)
+        out_dir = validate_safe_path(args.output)
+    except ValueError as exc:
+        sys.exit(f"Hata: {exc}")
     if not in_dir.exists():
         sys.exit(f"Hata: Girdi klasörü bulunamadı: {in_dir}")
-    out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
-    imgs = extract_zips_if_needed(in_dir, out_dir / "_extracted")
+    try:
+        imgs = extract_zips_if_needed(in_dir, out_dir / "_extracted")
+    except ValueError as exc:
+        sys.exit(f"Hata: {exc}")
     print(f"Toplam Görüntü Sayısı: {len(imgs)}")
     for idx, p in enumerate(imgs, 1):
-        with Image.open(p) as im:
-            w, h = im.size
+        try:
+            with open_image_safely(p) as im:
+                w, h = im.size
+        except ValueError as exc:
+            sys.exit(f"Hata: {exc}")
         print(f"[{idx:03d}] {p.name}  ({w}x{h} px)  ->  {p}")
 
 
 def cmd_split(args: argparse.Namespace) -> None:
-    img_path = Path(args.image)
+    try:
+        img_path = validate_safe_path(args.image)
+        out_dir = validate_safe_path(args.output)
+    except ValueError as exc:
+        sys.exit(f"Hata: {exc}")
     if not img_path.is_file():
         sys.exit(f"Hata: Görüntü dosyası bulunamadı: {img_path}")
-    out_dir = Path(args.output)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    with Image.open(img_path) as im:
-        im = im.convert("RGB")
-        w, h = im.size
-        stem = img_path.stem
+    try:
+        with open_image_safely(img_path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            stem = sanitize_filename(img_path.stem, fallback="varak")
 
-        # Osmanlı defterlerinde sağ sayfa önce (a yüzü), sol sayfa sonra (b yüzü) okunur.
-        halves = [
-            ("R", im.crop((int(w * 0.47), 0, w, h))),
-            ("L", im.crop((0, 0, int(w * 0.53), h))),
-        ]
-        for side, sub in halves:
-            sw, sh = sub.size
-            full_side = out_dir / f"{stem}_{side}_full.jpg"
-            sub.save(full_side, quality=92)
-            print(f"Kaydedildi: {full_side} ({sw}x{sh})")
+            # Osmanlı defterlerinde sağ sayfa önce (a yüzü), sol sayfa sonra (b yüzü) okunur.
+            halves = [
+                ("R", im.crop((int(w * 0.47), 0, w, h))),
+                ("L", im.crop((0, 0, int(w * 0.53), h))),
+            ]
+            for side, sub in halves:
+                sw, sh = sub.size
+                full_side = validate_safe_path(out_dir / f"{stem}_{side}_full.jpg", base_dir=out_dir)
+                sub.save(full_side, quality=92)
+                print(f"Kaydedildi: {full_side} ({sw}x{sh})")
 
-            if args.bands:
-                bands = [
-                    ("1_top", (0, 0, sw, int(sh * 0.37))),
-                    ("2_mid", (0, int(sh * 0.31), sw, int(sh * 0.69))),
-                    ("3_bot", (0, int(sh * 0.63), sw, sh)),
-                ]
-                for bname, box in bands:
-                    bp = out_dir / f"{stem}_{side}_{bname}.png"
-                    sub.crop(box).save(bp)
-                    print(f"  Şerit: {bp}")
+                if args.bands:
+                    bands = [
+                        ("1_top", (0, 0, sw, int(sh * 0.37))),
+                        ("2_mid", (0, int(sh * 0.31), sw, int(sh * 0.69))),
+                        ("3_bot", (0, int(sh * 0.63), sw, sh)),
+                    ]
+                    for bname, box in bands:
+                        bp = validate_safe_path(out_dir / f"{stem}_{side}_{bname}.png", base_dir=out_dir)
+                        sub.crop(box).save(bp)
+                        print(f"  Şerit: {bp}")
+    except ValueError as exc:
+        sys.exit(f"Hata: {exc}")
 
 
 def cmd_crop(args: argparse.Namespace) -> None:
-    img_path = Path(args.image)
+    try:
+        img_path = validate_safe_path(args.image)
+        out_path = validate_safe_path(args.output)
+    except ValueError as exc:
+        sys.exit(f"Hata: {exc}")
     if not img_path.is_file():
         sys.exit(f"Hata: Görüntü dosyası bulunamadı: {img_path}")
-    out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     try:
-        vals = [float(v.strip()) for v in args.box.split(",")]
-    except ValueError:
-        sys.exit("Hata: --box parametresi sayısal değerlerden oluşmalıdır ('x1,y1,x2,y2').")
-    if len(vals) != 4:
-        sys.exit("Hata: --box parametresi 'x1,y1,x2,y2' formatında 4 sayı olmalıdır (0.0-1.0 oran veya piksel).")
+        with open_image_safely(img_path) as im:
+            im = im.convert("RGB")
+            w, h = im.size
+            zoom_val = float(args.zoom) if args.zoom is not None else 1.0
+            x1, y1, x2, y2, out_w, out_h = compute_safe_crop_box(w, h, args.box, zoom=zoom_val)
 
-    with Image.open(img_path) as im:
-        im = im.convert("RGB")
-        w, h = im.size
-        if all(0.0 <= v <= 1.0 for v in vals):
-            x1, y1, x2, y2 = int(vals[0] * w), int(vals[1] * h), int(vals[2] * w), int(vals[3] * h)
-        else:
-            x1, y1, x2, y2 = [int(v) for v in vals]
+            crop = im.crop((x1, y1, x2, y2))
+            if zoom_val != 1.0:
+                resample = Image.Resampling.NEAREST if args.nearest else Image.Resampling.LANCZOS
+                crop = crop.resize((out_w, out_h), resample)
 
-        x1, x2 = max(0, min(w, x1)), max(0, min(w, x2))
-        y1, y2 = max(0, min(h, y1)), max(0, min(h, y2))
-        if x2 <= x1 or y2 <= y1:
-            sys.exit(f"Hata: Geçersiz kesit koordinatları ({x1},{y1},{x2},{y2}); x2 > x1 ve y2 > y1 olmalıdır.")
-
-        crop = im.crop((x1, y1, x2, y2))
-        if args.zoom and args.zoom > 1:
-            resample = Image.Resampling.NEAREST if args.nearest else Image.Resampling.LANCZOS
-            crop = crop.resize((int(crop.width * args.zoom), int(crop.height * args.zoom)), resample)
-
-        crop.save(out_path)
-        print(f"1:1 Kanıt Kesiti Kaydedildi: {out_path} ({crop.width}x{crop.height} px, kaynak kutu=({x1},{y1},{x2},{y2}))")
+            crop.save(out_path)
+            print(f"1:1 Kanıt Kesiti Kaydedildi: {out_path} ({crop.width}x{crop.height} px, kaynak kutu=({x1},{y1},{x2},{y2}))")
+    except ValueError as exc:
+        sys.exit(f"Hata: {exc}")
 
 
 def hicri_miladi_cevir(year: int) -> dict[str, int | str]:
@@ -436,11 +651,15 @@ def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]
     ancestor_nodes: dict[tuple[str, str], str] = {}
     anc_counter = 0
 
+    def _safe_mermaid_text(text: object) -> str:
+        s = _CONTROL_CHAR_RE.sub(" ", str(text or ""))
+        return s.replace('"', "'").replace("`", "'").replace("<", "&lt;").replace(">", "&gt;").strip()
+
     for item in enriched:
         nid = str(item["node_id"])
-        hane = str(item["hane"])
-        isim = str(item["isim"]).replace('"', "'")
-        unvan = str(item["unvan"]).replace('"', "'")
+        hane = _safe_mermaid_text(item["hane"])
+        isim = _safe_mermaid_text(item["isim"])
+        unvan = _safe_mermaid_text(item["unvan"])
         label_parts = [f"Hane {hane}: {isim}"]
         if unvan:
             label_parts[0] += f" ({unvan})"
@@ -468,8 +687,9 @@ def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]
                 anc_counter += 1
                 parent_id = f"A{anc_counter}"
                 ancestor_nodes[anc_key] = parent_id
-                safe_baba = baba.replace('"', "'")
-                lines.append(f'    {parent_id}["Hane {hane}: {safe_baba} (Ata / Baba)"]')
+                safe_baba = _safe_mermaid_text(baba)
+                safe_hane = _safe_mermaid_text(hane)
+                lines.append(f'    {parent_id}["Hane {safe_hane}: {safe_baba} (Ata / Baba)"]')
             else:
                 parent_id = ancestor_nodes[anc_key]
         lines.append(f"    {parent_id} --> {nid}")
@@ -507,23 +727,34 @@ def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]
     }
 
 
-def cmd_lineage_tree(args: argparse.Namespace) -> None:
-    raw = (args.records_json or "").strip()
+def _load_records_json_arg(raw_arg: str) -> object:
+    """Inline JSON dizisini veya güvenli dosya yolundan boyut-sınırlı JSON yükler."""
+    raw = (raw_arg or "").strip()
     if not raw:
-        sys.exit("Hata: --records-json parametresi boş olamaz.")
-    candidate_path = Path(raw)
-    if candidate_path.is_file():
+        raise ValueError("--records-json parametresi boş olamaz.")
+    if len(raw.encode("utf-8")) > MAX_JSON_BYTES:
+        raise ValueError(f"JSON girdisi izin verilen boyutu ({MAX_JSON_BYTES} B) aşıyor.")
+    # Inline JSON hızlı ayrımı
+    if raw.startswith("[") or raw.startswith("{"):
         try:
-            payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+            return json.loads(raw)
         except Exception as exc:
-            sys.exit(f"Hata: JSON dosyası okunamadı: {exc}")
-    else:
-        try:
-            payload = json.loads(raw)
-        except Exception as exc:
-            sys.exit(f"Hata: Geçersiz JSON girdisi: {exc}")
+            raise ValueError(f"Geçersiz JSON girdisi: {exc}") from exc
 
+    safe_path = validate_safe_path(raw)
+    if not safe_path.is_file():
+        raise ValueError(f"Geçersiz JSON girdisi veya dosya bulunamadı: {raw}")
+    if safe_path.stat().st_size > MAX_JSON_BYTES:
+        raise ValueError(f"JSON dosyası izin verilen boyutu ({MAX_JSON_BYTES} B) aşıyor.")
     try:
+        return json.loads(safe_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        raise ValueError(f"JSON dosyası okunamadı: {exc}") from exc
+
+
+def cmd_lineage_tree(args: argparse.Namespace) -> None:
+    try:
+        payload = _load_records_json_arg(args.records_json)
         res = build_lineage_mermaid(payload)
     except ValueError as exc:
         sys.exit(f"Hata: {exc}")
@@ -744,7 +975,8 @@ def trace_migration_timeline(records: list[dict[str, object]]) -> dict[str, obje
             })
 
     def _safe(text: object) -> str:
-        return str(text or "").replace('"', "'").replace("|", "/")
+        s = _CONTROL_CHAR_RE.sub(" ", str(text or ""))
+        return s.replace('"', "'").replace("|", "/").replace("`", "'").replace("<", "&lt;").replace(">", "&gt;").strip()
 
     lines: list[str] = ["flowchart LR"]
     for loc in unique_locations:
@@ -810,22 +1042,8 @@ def trace_migration_timeline(records: list[dict[str, object]]) -> dict[str, obje
 
 
 def cmd_migration_map(args: argparse.Namespace) -> None:
-    raw = (args.records_json or "").strip()
-    if not raw:
-        sys.exit("Hata: --records-json parametresi boş olamaz.")
-    candidate_path = Path(raw)
-    if candidate_path.is_file():
-        try:
-            payload = json.loads(candidate_path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            sys.exit(f"Hata: JSON dosyası okunamadı: {exc}")
-    else:
-        try:
-            payload = json.loads(raw)
-        except Exception as exc:
-            sys.exit(f"Hata: Geçersiz JSON girdisi: {exc}")
-
     try:
+        payload = _load_records_json_arg(args.records_json)
         res = trace_migration_timeline(payload)
     except ValueError as exc:
         sys.exit(f"Hata: {exc}")
