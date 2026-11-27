@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install minimal dependencies
+        run: python3 -m pip install --no-cache-dir pillow
+
+      - name: Syntax checks
+        run: |
+          python3 -m py_compile scripts/crop_and_verify.py scripts/test_crop_and_verify.py
+          node --check scripts/dab_helpers.js
+
+      - name: Run unit tests
+        run: PYTHONPATH=scripts python3 -m unittest discover -s scripts -p "test_*.py" -v
