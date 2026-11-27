@@ -31,7 +31,7 @@ Bu beceri, **Said Sürücü**'nün seminerinden hareketle geliştirilmiş olup; 
 2. **Doğrulama / CAPTCHA ve WAF (`HTTP 418`) Kuralı:**
    - e-Devlet giriş ekranı, oturum zaman aşımı veya herhangi bir doğrulama/CAPTCHA ekranıyla karşılaşıldığında **derhal durun** ve işlemi tarayıcıda kullanıcının tamamlamasını isteyin.
    - `BelgeGoster.aspx` görüntü sunucusuna **asla paralel (`Promise.all`) çoklu istek göndermeyin**; paralel istekler güvenlik duvarını (`HTTP 418 — Erişim Engellendi`) tetikler. Yalnızca sıralı ve en az `1800 ms` aralıklı istek kullanın; `HTTP 418` alınırsa otomatik görüntü çekimini derhal durdurup kullanıcıya tam defter ve poz (`Mi`) numaralarını verin.
-3. **Sıfır Uydurma ve 1:1 Kesit Disiplini:** Osmanlıca el yazmasında okunamayan veya filigran altında kalan harfleri **asla tahminle tamamlamayın**; `[şüpheli okuma / filigran altında: ...]` olarak işaretleyin. Her kritik hane ve isim satırını [crop_and_verify.py](./scripts/crop_and_verify.py) veya `<canvas>` ile **1:1 piksel kesiti** alarak doğrulayın.
+3. **Sıfır Uydurma ve 1:1 Kesit Disiplini:** Osmanlıca el yazmasında okunamayan veya filigran altında kalan harfleri **asla tahminle tamamlamayın**; `[şüpheli okuma / filigran altında: ...]` veya `doğrulanmadı` olarak işaretleyin. Her kritik hane ve isim satırını [crop_and_verify.py](./scripts/crop_and_verify.py) veya `<canvas>` ile **1:1 piksel kesiti** alarak doğrulayın ve teslim öncesi `python3 scripts/crop_and_verify.py verify-citations --input <rapor.md|kayitlar.json>` komutuyla atıfsız iddia kalmadığını (`exit 0`) teyit edin.
 
 ---
 

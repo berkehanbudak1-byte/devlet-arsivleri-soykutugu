@@ -39,6 +39,7 @@ jobs:
           "$RUNNER_TEMP/no-pil-venv/bin/python" scripts/crop_and_verify.py query-builder --name "Mehmedoğlu" --place "Muğla" --year 1293
           "$RUNNER_TEMP/no-pil-venv/bin/python" scripts/crop_and_verify.py lineage-tree --records-json '[{"hane":1,"isim":"Halil","baba_adi":"Mustafa","yas":40,"hicri_yil":1260}]'
           "$RUNNER_TEMP/no-pil-venv/bin/python" scripts/crop_and_verify.py migration-map --records-json '[{"hicri_yil":1260,"kaza":"Üsküdar","karye":"Yakacık"}]'
+          "$RUNNER_TEMP/no-pil-venv/bin/python" scripts/crop_and_verify.py verify-citations --records-json '[{"isim":"Halil","fon":"BOA, NFS.d. 1423","vr":"12a"}]'
 
       - name: Install dependencies
         run: python3 -m pip install --no-cache-dir -r requirements.txt

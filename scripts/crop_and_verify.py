@@ -42,7 +42,68 @@ MAX_OUTPUT_PIXELS = 64_000_000
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+_MERMAID_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f\u0085\u2028\u2029]")
 _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]+')
+_DANGEROUS_URI_SCHEME_RE = re.compile(r"(?i)\b(?:javascript|vbscript|data)\s*:")
+_MERMAID_DIRECTIVE_TOKEN_RE = re.compile(
+    r"(?i)\b(?:click|href|classdef|linkstyle|callback|acctitle|accdescr)\b"
+)
+
+
+def _tr_lower(text: object) -> str:
+    """Türkçe İ (U+0130), ayrık I+U+0307 ve I karakterlerini güvenli biçimde küçük harfe çevirir."""
+    raw = str(text or "")
+    return raw.replace("I\u0307", "i").replace("İ", "i").replace("I", "ı").lower()
+
+
+def sanitize_mermaid_label(text: object) -> str:
+    """
+    Mermaid düğüm/kenar etiketlerini XSS, HTML enjeksiyonu ve Mermaid
+    direktif/etkileşim (`click`, `href`, `%%{init:...}%%`, satır sonu, tırnak,
+    köşeli/süslü parantez, noktalı virgül, dikey çubuk, ters tırnak, `#entity;`)
+    kaçışlarına karşı katı biçimde temizler.
+    """
+    s = _MERMAID_CONTROL_RE.sub(" ", str(text or ""))
+    # Mermaid yorum/direktif öneklerini (`%%`, `%%{...}%%`) etkisizleştir
+    s = re.sub(r"%{2,}", "%", s)
+    # Yapısal Mermaid/Markdown kaçış karakterlerini HTML entity öncesi dönüştür
+    s = (
+        s.replace("\\", "/")
+        .replace(";", ",")
+        .replace("|", "/")
+        .replace("{", "(")
+        .replace("}", ")")
+        .replace("`", " ")
+        .replace("#", "No.")
+    )
+    # Tehlikeli URI şemalarını ve etkileşimli Mermaid anahtar kelimelerini etkisizleştir
+    s = _DANGEROUS_URI_SCHEME_RE.sub("", s)
+    s = _MERMAID_DIRECTIVE_TOKEN_RE.sub("", s)
+    # HTML, tırnak ve köşeli parantez kaçışları (& her zaman ilk sırada;
+    # [ ve ] Mermaid düğüm sözdizimini kırmamak için &#91;/&#93; olarak kaçışlanır)
+    s = (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace('"', "&quot;")
+        .replace("'", "&apos;")
+        .replace("[", "&#91;")
+        .replace("]", "&#93;")
+    )
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def sanitize_markdown_cell(text: object) -> str:
+    """Markdown tablo hücrelerini ve liste metinlerini HTML/tablo/kod-bloğu enjeksiyonuna karşı temizler."""
+    s = _MERMAID_CONTROL_RE.sub(" ", str(text or ""))
+    s = (
+        s.replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("|", "/")
+        .replace("`", "'")
+    )
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def sanitize_filename(name: str, fallback: str = "output", max_length: int = 120) -> str:
@@ -597,21 +658,9 @@ def cmd_query_builder(args: argparse.Namespace) -> None:
 
 
 def _escape_mermaid_label(text: object, *, escape_pipe: bool = False) -> str:
-    """Mermaid etiketlerini yeni satır, tırnak ve köşeli/açılı parantez enjeksiyonundan arındırır."""
-    s = str(text or "")
-    s = s.replace("\r", " ").replace("\n", " ").replace("\u2028", " ").replace("\u2029", " ")
-    s = _CONTROL_CHAR_RE.sub(" ", s)
-    s = (
-        s.replace('"', "'")
-        .replace("`", "'")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace("[", "&#91;")
-        .replace("]", "&#93;")
-    )
-    if escape_pipe:
-        s = s.replace("|", "/")
-    return re.sub(r"\s+", " ", s).strip()
+    """Geriye dönük uyumluluk sarmalayıcısı; tüm Mermaid kaçışlarını `sanitize_mermaid_label` üzerinden yürütür."""
+    _ = escape_pipe  # sanitize_mermaid_label dikey çubuğu (|) her zaman güvenli biçimde kaçışlar
+    return sanitize_mermaid_label(text)
 
 
 def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]:
@@ -680,9 +729,9 @@ def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]
 
     for item in enriched:
         nid = str(item["node_id"])
-        hane = _escape_mermaid_label(item["hane"])
-        isim = _escape_mermaid_label(item["isim"])
-        unvan = _escape_mermaid_label(item["unvan"])
+        hane = sanitize_mermaid_label(item["hane"]) or "1"
+        isim = sanitize_mermaid_label(item["isim"]) or "—"
+        unvan = sanitize_mermaid_label(item["unvan"])
         label_parts = [f"Hane {hane}: {isim}"]
         if unvan:
             label_parts[0] += f" ({unvan})"
@@ -693,7 +742,7 @@ def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]
         elif item["defter_miladi_hicri"] is not None:
             label_parts.append(f"Defter: {item['hicri_yil']} ({item['defter_miladi_hicri']})")
 
-        label = " | ".join(label_parts)
+        label = " · ".join(label_parts)
         lines.append(f'    {nid}["{label}"]')
 
     for item in enriched:
@@ -710,18 +759,14 @@ def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]
                 anc_counter += 1
                 parent_id = f"A{anc_counter}"
                 ancestor_nodes[anc_key] = parent_id
-                safe_baba = _escape_mermaid_label(baba)
-                safe_hane = _escape_mermaid_label(hane)
+                safe_baba = sanitize_mermaid_label(baba) or "—"
+                safe_hane = sanitize_mermaid_label(hane) or "1"
                 lines.append(f'    {parent_id}["Hane {safe_hane}: {safe_baba} (Ata / Baba)"]')
             else:
                 parent_id = ancestor_nodes[anc_key]
         lines.append(f"    {parent_id} --> {nid}")
 
     mermaid_str = "\n".join(lines)
-
-    def _safe_md_cell(val: object) -> str:
-        s = re.sub(r"[\r\n\u2028\u2029]+", " ", str(val or ""))
-        return _CONTROL_CHAR_RE.sub(" ", s).replace("|", "/").strip()
 
     md_lines = [
         "### Osmanlı Arşiv Hane Soy Ağacı (Pedigree & Miladî Doğum Tablosu)",
@@ -741,8 +786,11 @@ def build_lineage_mermaid(records: list[dict[str, object]]) -> dict[str, object]
             if item["dogum_miladi_hicri"] is not None
             else "—"
         )
+        md_hane = sanitize_markdown_cell(item["hane"]) or "—"
+        md_isim = sanitize_markdown_cell(item["isim"]) or "—"
+        md_baba = sanitize_markdown_cell(item["baba_adi"]) or "—"
         md_lines.append(
-            f"| {_safe_md_cell(item['hane'])} | {_safe_md_cell(item['isim'])} | {_safe_md_cell(item['baba_adi']) or '—'} | {yas_str} | {yil_str} | {dogum_str} |"
+            f"| {md_hane} | {md_isim} | {md_baba} | {yas_str} | {yil_str} | {dogum_str} |"
         )
     md_lines.extend(["", "```mermaid", mermaid_str, "```"])
     markdown_str = "\n".join(md_lines)
@@ -1003,20 +1051,28 @@ def trace_migration_timeline(records: list[dict[str, object]]) -> dict[str, obje
 
     lines: list[str] = ["flowchart LR"]
     for loc in unique_locations:
-        parts = [x for x in [str(loc["kaza"]), str(loc["nahiye"]), str(loc["karye"])] if x]
-        title = " / ".join(parts)
+        parts = [
+            sanitize_mermaid_label(x)
+            for x in [loc["kaza"], loc["nahiye"], loc["karye"]]
+            if str(x).strip()
+        ]
+        parts = [p for p in parts if p]
+        title = " / ".join(parts) or "Yerleşim"
         if loc["eski_ad"]:
-            title += f" (Eski: {loc['eski_ad']})"
+            safe_old = sanitize_mermaid_label(loc["eski_ad"])
+            if safe_old:
+                title += f" (Eski: {safe_old})"
         if loc["years"]:
             yrs = ", ".join(str(y) for y in loc["years"])
-            title += f" [{yrs}]"
-        lines.append(f'    {loc["loc_id"]}["{_escape_mermaid_label(title, escape_pipe=True)}"]')
+            title += f" ({yrs})"
+        lines.append(f'    {loc["loc_id"]}["{title}"]')
 
     for tr in transitions:
         ekey = (str(tr["from_loc_id"]), str(tr["to_loc_id"]), str(tr["edge_text"]))
         if ekey not in seen_edges:
             seen_edges.add(ekey)
-            lines.append(f'    {tr["from_loc_id"]} -->|"{_escape_mermaid_label(tr["edge_text"], escape_pipe=True)}"| {tr["to_loc_id"]}')
+            safe_edge = sanitize_mermaid_label(tr["edge_text"]) or "Geçiş"
+            lines.append(f'    {tr["from_loc_id"]} -->|"{safe_edge}"| {tr["to_loc_id"]}')
 
     mermaid_str = "\n".join(lines)
 
@@ -1033,22 +1089,36 @@ def trace_migration_timeline(records: list[dict[str, object]]) -> dict[str, obje
             yil_cell = str(row["miladi_yil"])
         else:
             yil_cell = "—"
-        detail_cell = " · ".join(x for x in [str(row["kisi"]), str(row["olay"]), str(row["fon"])] if x) or "—"
+        detail_parts = [
+            sanitize_markdown_cell(x)
+            for x in [row["kisi"], row["olay"], row["fon"]]
+            if str(x).strip()
+        ]
+        detail_cell = " · ".join(p for p in detail_parts if p) or "—"
+        md_kaza = sanitize_markdown_cell(row["kaza"]) or "—"
+        md_nahiye = sanitize_markdown_cell(row["nahiye"]) or "—"
+        md_karye = sanitize_markdown_cell(row["karye"]) or "—"
+        md_eski = sanitize_markdown_cell(row["eski_ad"]) or "—"
         md_lines.append(
-            f"| {row['step']} | {yil_cell} | {row['kaza'] or '—'} | {row['nahiye'] or '—'} | "
-            f"{row['karye'] or '—'} | {row['eski_ad'] or '—'} | {detail_cell} |"
+            f"| {row['step']} | {yil_cell} | {md_kaza} | {md_nahiye} | "
+            f"{md_karye} | {md_eski} | {detail_cell} |"
         )
 
     if cross_references:
         md_lines.extend(["", "#### Köy Adı ve İdari Bağ Çapraz Başvuruları"])
         for cr in cross_references:
             if cr["type"] == "IDARI_BAG_DEGISIKLIGI":
-                chain = " -> ".join(f"{j['kaza']}/{j['nahiye'] or '—'}" for j in cr["jurisdictions"])
-                md_lines.append(f"- **{cr['karye']}** idari bağlılık değişimi: {chain}")
+                chain = " -> ".join(
+                    f"{sanitize_markdown_cell(j['kaza']) or '—'}/{sanitize_markdown_cell(j['nahiye']) or '—'}"
+                    for j in cr["jurisdictions"]
+                )
+                md_lines.append(f"- **{sanitize_markdown_cell(cr['karye']) or '—'}** idari bağlılık değişimi: {chain}")
             elif cr["type"] == "ESKI_AD_ESLESMESI":
+                safe_variants = [sanitize_markdown_cell(v) for v in cr["variants"][:6] if str(v).strip()]
                 md_lines.append(
-                    f"- **{cr['karye']}** (Eski Ad: *{cr['eski_ad']}*) katalog varyantları: "
-                    f"{', '.join(cr['variants'][:6])}"
+                    f"- **{sanitize_markdown_cell(cr['karye']) or '—'}** "
+                    f"(Eski Ad: *{sanitize_markdown_cell(cr['eski_ad']) or '—'}*) katalog varyantları: "
+                    f"{', '.join(safe_variants)}"
                 )
 
     md_lines.extend(["", "```mermaid", mermaid_str, "```"])
@@ -1072,6 +1142,652 @@ def cmd_migration_map(args: argparse.Namespace) -> None:
         sys.exit(f"Hata: {exc}")
 
     print(res["markdown"])
+
+
+# 1:1 Arşiv Atıf Doğrulama (verify-citations) Desenleri
+_CITATION_PLACEHOLDER_VALUES = {
+    "",
+    "-",
+    "—",
+    "–",
+    "?",
+    "yok",
+    "none",
+    "null",
+    "n/a",
+    "na",
+    "tbd",
+    "todo",
+    "unknown",
+    "bilinmiyor",
+    "belirsiz",
+    "tahmin",
+    "tahmini",
+    "rivayet",
+    "aile rivayeti",
+    "söylenti",
+    "soylenti",
+    "internet",
+    "wikipedia",
+    "chatgpt",
+    "genel tarih",
+}
+
+_UNVERIFIED_MARKERS_RE = re.compile(
+    r"(?:"
+    r"doğrulanmadı|dogrulanmadi|doğrulanmamış|dogrulanmamis|"
+    r"teyit\s+edilmedi|teyitsiz|"
+    r"şüpheli\s+okuma|supheli\s+okuma|"
+    r"\bunverified\b"
+    r")"
+)
+
+_ARCHIVAL_FOND_PATTERNS: list[re.Pattern[str]] = [
+    # BOA Defter Serileri
+    re.compile(
+        r"\b(?:NFS\.d|ML\.VRD\.TMT\.d|M[ŞS]H\.[ŞS]SC\.d|MAD\.d|TT\.d|TK\.GM\.d|TKG\.KK(?:\.TTd)?|"
+        r"D\.+CRD\.d|ML\.CRD\.d|EV\.(?:HMH\.)?d)\.{0,3}(?:\s*(?:No\.?|Nr\.?|:|#)?\s*\d[\dA-Za-z/\-\.]*)?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\bA\.\{?(?:RSK|DVNS\.?MHM)\.d\.{0,3}(?:\s*(?:No\.?|Nr\.?|:|#)?\s*\d[\dA-Za-z/\-\.]*)?",
+        re.IGNORECASE,
+    ),
+    # BOA Belge Fonları
+    re.compile(
+        r"\b(?:DH\.(?:SN\.+THR|SN\.+M|İ\.UM|I\.UM|TMIK\.[SM]|İD|ID|MKT|EUM|ŞFR|SFR)|"
+        r"A\.\}?MKT\.(?:DV|MVL|NZD|UM|MHM)|"
+        r"Y\.+PRK\.[A-ZÇĞİÖŞÜ]+|"
+        r"[İI]\.+DH|[İI]\.+MMS|"
+        r"C\.+(?:DH|EV|TZ|ADL|ML))\.{0,3}(?:\s*(?:No\.?|Nr\.?|:|#)?\s*\d[\dA-Za-z/\-\.]*)?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:MVL|BEO|HAT|ŞD|SD)\.?[\s,:/#\-]+\d[\dA-Za-z/\-\.]*",
+        re.IGNORECASE,
+    ),
+    # BCA (Cumhuriyet Arşivi) Fonları
+    re.compile(
+        r"\bBCA\b[\s,:;\-]*\d+(?:[-.]\d+){1,}(?:[\s,/\-]+\d[\dA-Za-z/\-\.]*)?",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"\b(?:130[-.]16[-.]13[-.]2|272[-.]\d+[-.]\d+[-.]\d+|30[-.](?:18|11|10)[-.]\d+[-.]\d+|180[-.]9[-.]\d+[-.]\d+)\b"
+    ),
+    # Tamamlayıcı Resmi Tarih Arşivleri
+    re.compile(
+        r"\b(?:kadisicilleri\.org|[İI]SAM[\s,:/\-]+(?:Şer['’]?iyye|Ser['’]?iyye|Sicil|Kadı)|"
+        r"MSB[\s,:;\-]+(?:110[-.]9|[ŞS]ehit)|[ŞS]ehit\s+Bilgi\s+Kap[ıi]s[ıi]|"
+        r"(?:TKGM|Kuy[ûu]d[\-\s]?[ıi]\s+Kad[îi]me|VGM)[\s,:;\-]+(?:defter|kay[ıi]t|no\.?|\d[\d/\-\.]*))",
+        re.IGNORECASE,
+    ),
+]
+
+_EDEVLET_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(r"\be[\-\s]?devlet\b", re.IGNORECASE),
+    re.compile(r"\balt[\-\s]?[üu]st\s+soy\b", re.IGNORECASE),
+    re.compile(r"\b[iİı]sim\s+denklik\b", re.IGNORECASE),
+    re.compile(r"\bnv[iİı]gm\b", re.IGNORECASE),
+    re.compile(r"turkiye\.gov\.tr/nvi-[a-z0-9\-]+", re.IGNORECASE),
+    re.compile(r"\bsicill[\-\s]?i\s+n[üu]fus\b", re.IGNORECASE),
+    re.compile(r"\b(?:esas\s+k[üu]t[üu]k|n[üu]fus\s+k[üu]t[üu][ğg][üu]|vukuatl[ıi]\s+n[üu]fus)\b", re.IGNORECASE),
+]
+
+_ARCHIVAL_LOCATOR_PATTERNS: list[re.Pattern[str]] = [
+    re.compile(
+        r"\b(?:fond?|fon\s*kodu|kutu|dosya|g[öo]mlek|defter(?:\s*no)?|varak|vr\.?|poz|belge(?:\s*no)?|"
+        r"h[üu]k[üu]m(?:\s*no)?|sicil(?:\s*no)?|cilt|k[üu]t[üu]k|barkod|box|folder|folio)\b"
+        r"\s*[:=#.\-]?\s*(?:\d+[A-Za-z]?|[A-Za-z]{1,4}[-/]\d+)(?:[-/.]\d+[A-Za-z]?)*",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\bmi\s*[:=#]\s*\d+(?:[-–]\d+)?\b", re.IGNORECASE),
+]
+
+_PRIMARY_CITATION_KEYS = (
+    "fon",
+    "fon_kodu",
+    "kaynak",
+    "arsiv",
+    "archive",
+    "source",
+    "citation",
+    "citations",
+    "ref",
+    "referans",
+    "edevlet_ref",
+    "e_devlet_ref",
+    "belge",
+    "defter",
+    "kaynakca",
+)
+
+_LOCATOR_KEYS = (
+    "defter_no",
+    "dosya",
+    "gomlek",
+    "gömlek",
+    "kutu",
+    "box",
+    "folder",
+    "varak",
+    "vr",
+    "poz",
+    "mi",
+    "belge_no",
+    "barkod",
+    "yer_bilgisi",
+    "sicil_no",
+    "cilt",
+    "kutuk",
+    "kütük",
+)
+
+_STATUS_KEYS = (
+    "durum",
+    "status",
+    "kanit_seviyesi",
+    "evidence_level",
+    "not",
+    "note",
+    "serh",
+    "aciklama",
+)
+
+_MD_CLAIM_HINT_RE = re.compile(
+    r"(?:\b1[4-9]\d{2}\b|\b20\d{2}\b|\b[HR]\.\s*\d{3,4}\b|"
+    r"doğdu|dogdu|doğum|dogum|vefat|öldü|oldu|oğlu|oglu|kızı|kizi|"
+    r"\bbin\b|\bbinti\b|veled[\-\s]?i|\bhane\b|karye|köy|koy|mahalle|"
+    r"göç|goc|mübadil|mubadil|muhacir|dede|\bata\b|kuşak|kusak|sülale|sulale|"
+    r"lakap|baba|anne|iskân|iskan|tahrir|defter|yerleşti|yerlesti|yaşadı|yasadi|"
+    r"\[kesin|\[güçlü|\[guclu|\[isim|doğrulanmadı|dogrulanmadi|\[\^[^\]]+\])",
+    re.IGNORECASE,
+)
+
+_MD_TABLE_SEP_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
+_MD_FOOTNOTE_DEF_RE = re.compile(r"^\[\^([^\]]+)\]:\s*(.*)$")
+_MD_FOOTNOTE_REF_RE = re.compile(r"\[\^([^\]]+)\]")
+_MD_LIST_ITEM_RE = re.compile(r"^\s*(?:[-*+]|\d+[.)])\s+(.*)$")
+_MD_TOC_LINK_RE = re.compile(r"^\[[^\]]+\]\(#[^)]+\)\s*$")
+
+
+def _flatten_citation_value(val: object, key_hint: str = "") -> list[str]:
+    """Kayıttaki atıf/yer bilgisi alanlarını (str, int, list, dict) düz metin listesine çevirir."""
+    out: list[str] = []
+    if val is None or isinstance(val, bool):
+        return out
+    if isinstance(val, dict):
+        for k, v in val.items():
+            out.extend(_flatten_citation_value(v, key_hint=str(k)))
+        return out
+    if isinstance(val, (list, tuple)):
+        for item in val:
+            out.extend(_flatten_citation_value(item, key_hint=key_hint))
+        return out
+    s = str(val).strip()
+    if not s or _tr_lower(s) in _CITATION_PLACEHOLDER_VALUES:
+        return out
+    if key_hint:
+        out.append(f"{key_hint}: {s}")
+    else:
+        out.append(s)
+    return out
+
+
+def _is_explicitly_unverified(text: str, rec: dict[str, object] | None = None) -> bool:
+    """Kaydın veya rapor satırının açıkça 'doğrulanmadı' / 'unverified' olarak işaretlenip işaretlenmediğini denetler."""
+    if rec is not None:
+        if rec.get("verified") is False or rec.get("dogrulandi") is False:
+            return True
+        for key in _STATUS_KEYS + _PRIMARY_CITATION_KEYS:
+            val = rec.get(key)
+            if val is not None and not isinstance(val, bool):
+                if _UNVERIFIED_MARKERS_RE.search(_tr_lower(val)):
+                    return True
+    return bool(_UNVERIFIED_MARKERS_RE.search(_tr_lower(text)))
+
+
+def _extract_archival_citations(text: str) -> tuple[list[str], bool]:
+    """
+    Metin içindeki 1:1 arşiv fonu, kutu/dosya/gömlek/defter/varak/poz yer bilgisi ve
+    e-Devlet / NVİGM referanslarını deterministik olarak çıkarır.
+    Dönüş: (citations, has_locator)
+    """
+    text = str(text or "").replace("I\u0307", "İ")
+    citations: list[str] = []
+    has_locator = False
+
+    def _add(tok: str) -> None:
+        cleaned = re.sub(r"\s+", " ", tok).strip(" ,.;:()[]{}")
+        if cleaned and cleaned not in citations:
+            citations.append(cleaned)
+
+    for pat in _ARCHIVAL_FOND_PATTERNS:
+        for m in pat.finditer(text):
+            matched = m.group(0)
+            _add(matched)
+            if re.search(r"\d", matched):
+                has_locator = True
+
+    for pat in _EDEVLET_PATTERNS:
+        for m in pat.finditer(text):
+            _add(m.group(0))
+            has_locator = True
+
+    for pat in _ARCHIVAL_LOCATOR_PATTERNS:
+        for m in pat.finditer(text):
+            _add(m.group(0))
+            has_locator = True
+
+    return citations, has_locator
+
+
+def _build_record_subject(rec: dict[str, object], idx: int) -> str:
+    parts: list[str] = []
+    name = str(rec.get("isim") or rec.get("kisi") or rec.get("ad") or rec.get("name") or "").strip()
+    if name:
+        parts.append(name)
+    baba = str(rec.get("baba_adi") or "").strip()
+    if baba:
+        parts.append(f"baba: {baba}")
+    place = str(rec.get("karye") or rec.get("koy") or rec.get("mahalle") or rec.get("kaza") or "").strip()
+    if place:
+        parts.append(place)
+    claim_txt = str(rec.get("claim") or rec.get("iddia") or rec.get("olay") or "").strip()
+    if claim_txt and not parts:
+        parts.append(claim_txt[:80])
+    hane = rec.get("hane")
+    if hane is not None and str(hane).strip():
+        parts.append(f"Hane {str(hane).strip()}")
+    return " · ".join(parts) if parts else f"Kayıt #{idx}"
+
+
+def _audit_dataset_records(
+    records: list[dict[str, object]],
+    *,
+    require_locator: bool = False,
+) -> dict[str, object]:
+    if not records:
+        raise ValueError("Denetlenecek kayıt listesi boş olamaz.")
+
+    claims: list[dict[str, object]] = []
+    warnings: list[str] = []
+
+    for idx, rec in enumerate(records, 1):
+        if not isinstance(rec, dict):
+            raise ValueError(f"{idx}. kayıt geçerli bir sözlük (dict) değil.")
+
+        citation_chunks: list[str] = []
+        for k in _PRIMARY_CITATION_KEYS:
+            if k in rec:
+                citation_chunks.extend(_flatten_citation_value(rec.get(k)))
+        for k in _LOCATOR_KEYS:
+            if k in rec:
+                citation_chunks.extend(_flatten_citation_value(rec.get(k), key_hint=k))
+
+        citation_blob = " | ".join(citation_chunks)
+        citations, has_locator = _extract_archival_citations(citation_blob)
+        explicitly_unverified = _is_explicitly_unverified(citation_blob, rec=rec)
+        subject = _build_record_subject(rec, idx)
+        loc = f"record[{idx}]"
+
+        if explicitly_unverified:
+            status = "EXPLICITLY_UNVERIFIED"
+            reason = "Açıkça 'doğrulanmadı' olarak işaretlenmiş (uydurma iddia yok)."
+        elif citations and (not require_locator or has_locator):
+            status = "CITED"
+            reason = "1:1 arşiv veya e-Devlet atfı doğrulandı."
+            if not has_locator:
+                warnings.append(
+                    f"{loc} ({subject}): Fon kodu mevcut ancak defter/kutu/gömlek/varak/poz yer bilgisi eksik."
+                )
+        else:
+            status = "UNCITED"
+            if citations and require_locator and not has_locator:
+                reason = "Fon kodu var ancak zorunlu kutu/dosya/gömlek/defter/varak/poz yer bilgisi eksik."
+            else:
+                reason = (
+                    "Geçerli arşiv fonu, kutu/dosya/gömlek/varak-poz veya e-Devlet referansı yok "
+                    "ve 'doğrulanmadı' etiketi bulunmuyor."
+                )
+
+        claims.append({
+            "index": idx,
+            "location": loc,
+            "subject": subject,
+            "status": status,
+            "citations": citations,
+            "has_locator": has_locator,
+            "reason": reason,
+        })
+
+    return _finalize_citation_report("dataset", claims, warnings)
+
+
+def _extract_markdown_claims(markdown_text: str) -> tuple[list[tuple[int, str]], dict[str, str]]:
+    """Markdown raporundan dipnot tanımlarını ve denetlenecek iddia satırlarını (tablo, liste, düzyazı) çıkarır."""
+    raw_lines = markdown_text.splitlines()
+    footnotes: dict[str, str] = {}
+    footnote_lines: set[int] = set()
+
+    in_fence = False
+    fence_marker = ""
+    current_fn: str | None = None
+    for idx, line in enumerate(raw_lines, 1):
+        stripped = line.strip()
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker
+            elif marker == fence_marker:
+                in_fence = False
+                fence_marker = ""
+            current_fn = None
+            continue
+        if in_fence:
+            continue
+        fn_match = _MD_FOOTNOTE_DEF_RE.match(line)
+        if fn_match:
+            current_fn = fn_match.group(1).strip()
+            footnotes[current_fn] = fn_match.group(2).strip()
+            footnote_lines.add(idx)
+            continue
+        if current_fn is not None and (line.startswith("  ") or line.startswith("\t")) and stripped:
+            footnotes[current_fn] = f"{footnotes[current_fn]} {stripped}".strip()
+            footnote_lines.add(idx)
+            continue
+        current_fn = None
+
+    table_and_list_claims: list[tuple[int, str]] = []
+    prose_hinted_claims: list[tuple[int, str]] = []
+    prose_fallback_claims: list[tuple[int, str]] = []
+
+    in_fence = False
+    fence_marker = ""
+    i = 0
+    total = len(raw_lines)
+    while i < total:
+        lineno = i + 1
+        line = raw_lines[i]
+        stripped = line.strip()
+
+        if stripped.startswith("```") or stripped.startswith("~~~"):
+            marker = stripped[:3]
+            if not in_fence:
+                in_fence = True
+                fence_marker = marker
+            elif marker == fence_marker:
+                in_fence = False
+                fence_marker = ""
+            i += 1
+            continue
+
+        if in_fence or not stripped or lineno in footnote_lines:
+            i += 1
+            continue
+
+        # Başlık, yatay çizgi veya HTML yorumu atla
+        if (
+            stripped.startswith("#")
+            or re.match(r"^(?:[-*_]\s*){3,}$", stripped)
+            or (stripped.startswith("<!--") and stripped.endswith("-->"))
+        ):
+            i += 1
+            continue
+
+        # Markdown tablosu (başlık + ayırıcı + veri satırları)
+        if "|" in stripped and i + 1 < total and _MD_TABLE_SEP_RE.match(raw_lines[i + 1]):
+            i += 2  # Başlık ve ayırıcı satırları atla
+            while i < total:
+                row_line = raw_lines[i].strip()
+                if not row_line or "|" not in row_line or _MD_TABLE_SEP_RE.match(row_line):
+                    break
+                table_and_list_claims.append((i + 1, row_line))
+                i += 1
+            continue
+
+        if _MD_TABLE_SEP_RE.match(stripped):
+            i += 1
+            continue
+
+        # Madde işareti / numaralı liste
+        list_m = _MD_LIST_ITEM_RE.match(line)
+        if list_m:
+            body = list_m.group(1).strip()
+            if body and not _MD_TOC_LINK_RE.match(body):
+                table_and_list_claims.append((lineno, body))
+            i += 1
+            continue
+
+        # Alıntı veya düzyazı satırı
+        clean_prose = stripped.lstrip(">").strip()
+        if clean_prose:
+            prose_fallback_claims.append((lineno, clean_prose))
+            if _MD_CLAIM_HINT_RE.search(clean_prose):
+                prose_hinted_claims.append((lineno, clean_prose))
+        i += 1
+
+    extracted = table_and_list_claims + prose_hinted_claims
+    if not extracted:
+        extracted = prose_fallback_claims
+    extracted.sort(key=lambda pair: pair[0])
+    return extracted, footnotes
+
+
+def _audit_markdown_report(markdown_text: str, *, require_locator: bool = False) -> dict[str, object]:
+    extracted, footnotes = _extract_markdown_claims(markdown_text)
+    if not extracted:
+        raise ValueError("Markdown raporunda denetlenecek iddia satırı bulunamadı.")
+
+    claims: list[dict[str, object]] = []
+    warnings: list[str] = []
+
+    for idx, (lineno, text) in enumerate(extracted, 1):
+        ref_keys = _MD_FOOTNOTE_REF_RE.findall(text)
+        expanded = text
+        if ref_keys:
+            resolved_notes = [footnotes[k] for k in ref_keys if k in footnotes]
+            if resolved_notes:
+                expanded = f"{text} | {' | '.join(resolved_notes)}"
+
+        citations, has_locator = _extract_archival_citations(expanded)
+        explicitly_unverified = _is_explicitly_unverified(expanded)
+        subject = re.sub(r"\s+", " ", text).strip()
+        if len(subject) > 100:
+            subject = subject[:97] + "..."
+        loc = f"line:{lineno}"
+
+        if explicitly_unverified:
+            status = "EXPLICITLY_UNVERIFIED"
+            reason = "Açıkça 'doğrulanmadı' olarak işaretlenmiş (uydurma iddia yok)."
+        elif citations and (not require_locator or has_locator):
+            status = "CITED"
+            reason = "1:1 arşiv veya e-Devlet atfı doğrulandı."
+            if not has_locator:
+                warnings.append(
+                    f"{loc}: Fon kodu mevcut ancak defter/kutu/gömlek/varak/poz yer bilgisi eksik."
+                )
+        else:
+            status = "UNCITED"
+            if citations and require_locator and not has_locator:
+                reason = "Fon kodu var ancak zorunlu kutu/dosya/gömlek/defter/varak/poz yer bilgisi eksik."
+            else:
+                reason = (
+                    "Geçerli arşiv fonu, kutu/dosya/gömlek/varak-poz veya e-Devlet referansı yok "
+                    "ve 'doğrulanmadı' etiketi bulunmuyor."
+                )
+
+        claims.append({
+            "index": idx,
+            "location": loc,
+            "subject": subject,
+            "status": status,
+            "citations": citations,
+            "has_locator": has_locator,
+            "reason": reason,
+        })
+
+    return _finalize_citation_report("markdown", claims, warnings)
+
+
+def _finalize_citation_report(
+    input_format: str,
+    claims: list[dict[str, object]],
+    warnings: list[str],
+) -> dict[str, object]:
+    total = len(claims)
+    cited = sum(1 for c in claims if c["status"] == "CITED")
+    explicitly_unverified = sum(1 for c in claims if c["status"] == "EXPLICITLY_UNVERIFIED")
+    uncited_claims = [c for c in claims if c["status"] == "UNCITED"]
+    uncited = len(uncited_claims)
+    compliant = total > 0 and uncited == 0
+
+    return {
+        "compliant": compliant,
+        "input_format": input_format,
+        "summary": {
+            "total_claims": total,
+            "cited": cited,
+            "explicitly_unverified": explicitly_unverified,
+            "uncited": uncited,
+            "coverage_ratio": round((cited + explicitly_unverified) / total, 4) if total else 0.0,
+            "strict_cited_ratio": round(cited / total, 4) if total else 0.0,
+        },
+        "claims": claims,
+        "uncited_claims": uncited_claims,
+        "warnings": warnings,
+    }
+
+
+def verify_citations(
+    source: list[dict[str, object]] | dict[str, object] | str,
+    *,
+    input_format: str = "auto",
+    require_locator: bool = False,
+) -> dict[str, object]:
+    """
+    Bir soy kütüğü/göç veri setini (JSON liste/sözlük) veya Markdown raporunu
+    1:1 arşiv atıf kapsamı açısından deterministik olarak denetler.
+    Her iddia ya geçerli bir arşiv fonu/kutu-dosya-gömlek/varak-poz/e-Devlet
+    referansı taşımalı ya da açıkça `doğrulanmadı` olarak işaretlenmelidir.
+    """
+    fmt = (input_format or "auto").strip().lower()
+    if fmt not in {"auto", "json", "dataset", "markdown"}:
+        raise ValueError(f"Desteklenmeyen girdi biçimi: {input_format}")
+
+    if isinstance(source, list):
+        return _audit_dataset_records(source, require_locator=require_locator)
+
+    if isinstance(source, dict):
+        for list_key in ("records", "claims", "entries", "lineage", "timeline", "ancestors"):
+            if isinstance(source.get(list_key), list):
+                return _audit_dataset_records(source[list_key], require_locator=require_locator)
+        return _audit_dataset_records([source], require_locator=require_locator)
+
+    if isinstance(source, str):
+        stripped = source.strip()
+        if not stripped:
+            raise ValueError("Denetlenecek içerik boş olamaz.")
+        if fmt in {"json", "dataset"} or (fmt == "auto" and (stripped.startswith("[") or stripped.startswith("{"))):
+            try:
+                parsed = json.loads(stripped)
+            except Exception as exc:
+                if fmt in {"json", "dataset"}:
+                    raise ValueError(f"Geçersiz JSON girdisi: {exc}") from exc
+                return _audit_markdown_report(source, require_locator=require_locator)
+            return verify_citations(parsed, input_format="dataset", require_locator=require_locator)
+        return _audit_markdown_report(source, require_locator=require_locator)
+
+    raise ValueError("verify_citations girdisi liste, sözlük veya metin olmalıdır.")
+
+
+def format_citation_report_markdown(report: dict[str, object]) -> str:
+    """`verify_citations` çıktısını yapılandırılmış Markdown denetim raporuna dönüştürür."""
+    summary = report["summary"]
+    verdict = "UYUMLU (0 atıfsız iddia)" if report["compliant"] else f"UYUMSUZ ({summary['uncited']} atıfsız iddia)"
+    lines = [
+        "### 1:1 Arşiv Atıf Doğrulama Raporu (`verify-citations`)",
+        "",
+        f"- **Durum:** **{verdict}**",
+        f"- **Girdi Biçimi:** `{report['input_format']}`",
+        f"- **Toplam İddia:** {summary['total_claims']} "
+        f"(Atıflı: {summary['cited']} · Açıkça `doğrulanmadı`: {summary['explicitly_unverified']} · "
+        f"Atıfsız/İhlal: {summary['uncited']})",
+        f"- **Uyumluluk Oranı:** %{summary['coverage_ratio'] * 100:.1f} "
+        f"(Doğrudan Atıf Oranı: %{summary['strict_cited_ratio'] * 100:.1f})",
+        "",
+        "| # | Konum | Özne / Satır | Durum | Tespit Edilen Atıflar | Açıklama |",
+        "|---|-------|--------------|-------|-----------------------|----------|",
+    ]
+    for claim in report["claims"]:
+        cits = ", ".join(sanitize_markdown_cell(c) for c in claim["citations"]) or "—"
+        lines.append(
+            f"| {claim['index']} | {sanitize_markdown_cell(claim['location'])} | "
+            f"{sanitize_markdown_cell(claim['subject']) or '—'} | `{claim['status']}` | "
+            f"{cits} | {sanitize_markdown_cell(claim['reason'])} |"
+        )
+    if report.get("warnings"):
+        lines.extend(["", "#### Uyarılar"])
+        for w in report["warnings"]:
+            lines.append(f"- {sanitize_markdown_cell(w)}")
+    return "\n".join(lines)
+
+
+def _load_citation_source_arg(raw_arg: str, *, explicit_format: str = "auto") -> tuple[object, str]:
+    """Inline JSON, JSON dosya yolu veya Markdown rapor dosyasını boyut/yol sınırlarıyla yükler."""
+    raw = (raw_arg or "").strip()
+    if not raw:
+        raise ValueError("Girdi parametresi boş olamaz.")
+    if len(raw.encode("utf-8")) > MAX_JSON_BYTES:
+        raise ValueError(f"Girdi izin verilen boyutu ({MAX_JSON_BYTES} B) aşıyor.")
+
+    if explicit_format in {"auto", "json", "dataset"} and (raw.startswith("[") or raw.startswith("{")):
+        try:
+            return json.loads(raw), "dataset"
+        except Exception as exc:
+            if explicit_format in {"json", "dataset"}:
+                raise ValueError(f"Geçersiz JSON girdisi: {exc}") from exc
+
+    safe_path = validate_safe_path(raw)
+    if not safe_path.is_file():
+        raise ValueError(f"Girdi dosyası bulunamadı: {raw}")
+    if safe_path.stat().st_size > MAX_JSON_BYTES:
+        raise ValueError(f"Girdi dosyası izin verilen boyutu ({MAX_JSON_BYTES} B) aşıyor.")
+    text = safe_path.read_text(encoding="utf-8")
+    if explicit_format != "auto":
+        return text, explicit_format
+    if safe_path.suffix.lower() == ".json":
+        return text, "json"
+    if safe_path.suffix.lower() in {".md", ".markdown", ".txt"}:
+        return text, "markdown"
+    return text, "auto"
+
+
+def cmd_verify_citations(args: argparse.Namespace) -> None:
+    raw_input = args.input or args.records_json or args.markdown
+    explicit_fmt = "auto"
+    if args.records_json:
+        explicit_fmt = "json"
+    elif args.markdown:
+        explicit_fmt = "markdown"
+
+    try:
+        source, detected_fmt = _load_citation_source_arg(raw_input, explicit_format=explicit_fmt)
+        report = verify_citations(
+            source,
+            input_format=detected_fmt,
+            require_locator=bool(args.require_locator),
+        )
+    except ValueError as exc:
+        sys.exit(f"Hata: {exc}")
+
+    if args.format == "markdown":
+        print(format_citation_report_markdown(report))
+    else:
+        print(json.dumps(report, ensure_ascii=False, indent=2))
+
+    if not report["compliant"]:
+        sys.exit(1)
 
 
 def main() -> None:
@@ -1115,6 +1831,22 @@ def main() -> None:
     p_mm = sub.add_parser("migration-map", help="Kaza/nahiye/karye göç ve idari bağ kayıtlarından kronolojik zaman çizelgesi ve Mermaid flowchart LR diyagramı üretir.")
     p_mm.add_argument("--records-json", required=True, help="JSON dizisi veya JSON dosya yolu")
     p_mm.set_defaults(func=cmd_migration_map)
+
+    p_vc = sub.add_parser(
+        "verify-citations",
+        help="Soy kütüğü veri setini (JSON) veya Markdown raporunu 1:1 arşiv atfı / 'doğrulanmadı' uyumluluğu açısından denetler.",
+    )
+    vc_src = p_vc.add_mutually_exclusive_group(required=True)
+    vc_src.add_argument("--input", help="JSON veri seti (inline veya dosya yolu) veya Markdown rapor dosyası")
+    vc_src.add_argument("--records-json", help="JSON dizisi veya JSON dosya yolu")
+    vc_src.add_argument("--markdown", help="Denetlenecek Markdown rapor dosya yolu")
+    p_vc.add_argument("--format", choices=["json", "markdown"], default="json", help="Çıktı rapor biçimi (varsayılan: json)")
+    p_vc.add_argument(
+        "--require-locator",
+        action="store_true",
+        help="Sadece fon kodu yerine defter/kutu/dosya/gömlek/varak-poz veya e-Devlet yer bilgisini de zorunlu tut",
+    )
+    p_vc.set_defaults(func=cmd_verify_citations)
 
     args = parser.parse_args()
     args.func(args)
